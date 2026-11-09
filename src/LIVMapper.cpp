@@ -61,6 +61,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("common/img_compressed", img_compressed, false);
   nh.param<int>("common/img_decode_reduce", img_decode_reduce, 1);
   nh.param<double>("common/img_sync_tolerance", img_sync_tolerance, 0.002);
+  nh.param<double>("common/max_img_gap", max_img_gap, 0.5);
   nh.param<double>("common/auto_exit_idle_sec", auto_exit_idle_sec, 0.0);
 
   nh.param<bool>("vio/normal_en", normal_en, true);
@@ -207,8 +208,10 @@ void LIVMapper::loadCameras()
     ros::param::param<double>(ns + "/time_offset", time_offset, 0.0);
     ros::param::param<double>(ns + "/max_incidence_deg", max_incidence_deg, 90.0);
     ros::param::param<std::string>(ns + "/mask_file", mask_file, "");
-    vector<double> vignetting;
+    vector<double> vignetting, time_offset_steps;
     ros::param::param<vector<double>>(ns + "/vignetting", vignetting, vector<double>());
+    ros::param::param<vector<double>>(ns + "/time_offset_steps", time_offset_steps, vector<double>());
+    if (time_offset_steps.size() % 2) throw std::runtime_error(ns + "/time_offset_steps needs pairs [t, offset, ...]");
     if (R_cl.size() != 9 || P_cl.size() != 3) throw std::runtime_error(ns + "/Rcl (9 values) and " + ns + "/Pcl (3 values) are required");
     cv::Mat mask;
     if (!mask_file.empty())
@@ -219,7 +222,10 @@ void LIVMapper::loadCameras()
         cv::resize(mask, mask, cv::Size(camera->width(), camera->height()), 0, 0, cv::INTER_NEAREST);
     }
     vio_manager->addCamera(camera, R_cl, P_cl, time_offset, max_incidence_deg, mask, vignetting);
+    vio_manager->cams.back().time_offset_steps = time_offset_steps;
     ROS_INFO("Camera %d: topic %s, %dx%d", i, img_topics[i].c_str(), camera->width(), camera->height());
+    for (size_t k = 0; k < time_offset_steps.size(); k += 2)
+      ROS_INFO("Camera %d: time offset %.4f s from t = %.3f on", i, time_offset_steps[k + 1], time_offset_steps[k]);
   }
 }
 
@@ -383,6 +389,10 @@ void LIVMapper::handleVIO()
 
   vio_manager->omega_imu = p_imu->getLastAngVel();
   vio_manager->vel_world = _state.vel_end;
+  // time offsets that change during the recording (e.g. the capture timing of a camera after it restarted)
+  for (auto &cc : vio_manager->cams)
+    for (size_t k = 0; k + 1 < cc.time_offset_steps.size(); k += 2)
+      if (LidarMeasures.last_lio_update_time >= cc.time_offset_steps[k]) cc.time_offset = cc.time_offset_steps[k + 1];
   vio_manager->processFrame(LidarMeasures.measures.back().imgs, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
 
   if (imu_prop_enable) 
@@ -478,7 +488,7 @@ void LIVMapper::handleLIO()
     state_update_flg = true;
   }
 
-  if (pose_output_en && slam_mode_ != LIVO) writeEvoPose();
+  if (pose_output_en && (slam_mode_ != LIVO || lio_without_img)) writeEvoPose();
   
   euler_cur = RotMtoEuler(_state.rot_end);
   geoQuat = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
@@ -517,6 +527,8 @@ void LIVMapper::handleLIO()
     RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
   }
   *pcl_w_wait_pub = *laserCloudWorld;
+  // without an image no VIO step follows, which would otherwise add these points to the LiDAR map
+  if (lio_without_img && pcd_save_en && lidar_map_en) *pcl_wait_save_lidar += *laserCloudWorld;
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
   if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
@@ -672,6 +684,15 @@ void LIVMapper::run()
 
     stateEstimationAndMapping();
   }
+  // image callbacks run on their own spinner: stop it before the cameras are torn down
+  if (img_spinner) img_spinner->stop();
+  // every feature of the visual map keeps its whole frame alive (Feature::img_), about 15 MB per second of a two-camera
+  // recording: release the frames before savePCD builds its voxel grid, so the peak memory does not stack on top of them
+  if (vio_manager)
+    for (auto &kv : vio_manager->feat_map)
+      for (VisualPoint *pt : kv.second->voxel_points)
+        if (pt != nullptr)
+          for (Feature *ftr : pt->obs_) ftr->img_.release();
   savePCD();
 }
 
@@ -1102,7 +1123,7 @@ void LIVMapper::pushCameraImage(double stamp, int cam_idx, const cv::Mat &img)
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 {
   if (lid_raw_data_buffer.empty() && lidar_en) return false;
-  if (img_buffer.empty() && img_en) return false;
+  if (img_buffer.empty() && img_en && slam_mode_ != LIVO) return false; // LIVO: a camera dropout is handled below
   if (imu_buffer.empty() && imu_en) return false;
 
   switch (slam_mode_)
@@ -1168,7 +1189,6 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     case VIO:
     {
       // printf("!!! meas.lio_vio_flg: %d \n", meas.lio_vio_flg);
-      double img_capture_time = img_time_buffer.front() + exposure_time_init;
       /*** has img topic, but img topic timestamp larger than lidar end time,
        * process lidar topic. After LIO update, the meas.lidar_frame_end_time
        * will be refresh. ***/
@@ -1180,7 +1200,16 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       double lid_newest_time = lid_header_time_buffer.back() + lid_raw_data_buffer.back()->points.back().curvature / double(1000);
       double imu_newest_time = imu_buffer.back()->header.stamp.toSec();
 
-      if (img_capture_time < meas.last_lio_update_time + 0.00001)
+      // Camera dropout: no image within max_img_gap after the last update (an empty buffer counts only once the LiDAR
+      // is that far ahead, images arrive later than the LiDAR). Instead of merging every scan up to the next image
+      // into one update, cut one LiDAR period for a LIO update without VIO.
+      lio_without_img = img_buffer.empty() ? lid_newest_time > meas.last_lio_update_time + max_img_gap
+                                           : img_time_buffer.front() + exposure_time_init > meas.last_lio_update_time + max_img_gap;
+      if (img_buffer.empty() && !lio_without_img) return false;
+      double img_capture_time = lio_without_img ? meas.last_lio_update_time + 0.1 : img_time_buffer.front() + exposure_time_init;
+      if (lio_without_img) ROS_WARN_THROTTLE(1.0, "No camera image after %.3f: LIO without VIO", meas.last_lio_update_time);
+
+      if (!lio_without_img && img_capture_time < meas.last_lio_update_time + 0.00001)
       {
         img_buffer.pop_front();
         img_time_buffer.pop_front();
@@ -1262,6 +1291,14 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 
     case LIO:
     {
+      if (lio_without_img)
+      {
+        // no image for the last LIO update: skip VIO, wait for the next cut
+        lio_without_img = false;
+        meas.lio_vio_flg = WAIT;
+        meas.measures.clear();
+        return false;
+      }
       double img_capture_time = img_time_buffer.front() + exposure_time_init;
       meas.lio_vio_flg = VIO;
       // printf("[ Data Cut ] VIO \n");

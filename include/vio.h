@@ -93,6 +93,7 @@ struct CameraContext
   M3D Rcl, Rci_calib, Rci, Rcw, Jdphi_dR, Jdp_dR, Jdp_dt; // Rci/Pci include the time offset compensation of the current frame
   V3D Pcl, Pci_calib, Pci, Pcw;
   double time_offset = 0.0;       // capture time of this camera minus its image stamp used as EKF time (s)
+  vector<double> time_offset_steps; // optional [t, offset, t, offset, ...]: from EKF time t on, time_offset = offset
   double cos_max_incidence = 0.0; // view cone: points with z < cos * |p| in the camera frame are not used
   cv::Mat mask;                   // optional CV_8UC1 mask at the processing resolution, 0 = ignore
   vector<double> vignetting;      // optional log V(theta) = c0 theta^2 + c1 theta^4 + c2 theta^6, images are divided by V

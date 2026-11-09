@@ -93,6 +93,8 @@ public:
   int img_decode_reduce = 1;              // 1, 2, 4 or 8: decode / downsample images by this factor on arrival
   double img_sync_tolerance = 0.002;      // s, images closer than this belong to the same frame
   double img_incomplete_timeout = 0.3;    // s, a frame still missing a camera after this is used with the others
+  double max_img_gap = 0.5;               // s, LIVO: without an image for this long, LIO runs per LiDAR period without VIO
+  bool lio_without_img = false;           // the current LIO update has no image (camera dropout), no VIO follows
   std::map<long long, PendingFrame> pending_frames;
   int incomplete_frames = 0;
   ros::CallbackQueue img_callback_queue;
