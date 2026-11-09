@@ -56,6 +56,9 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("common/img_en", img_en, 1);
   nh.param<int>("common/lidar_en", lidar_en, 1);
   nh.param<string>("common/img_topic", img_topic, "/left_camera/image");
+  nh.param<vector<string>>("common/img_topics", img_topics, vector<string>());
+  nh.param<int>("common/img_decode_reduce", img_decode_reduce, 1);
+  nh.param<double>("common/img_sync_tolerance", img_sync_tolerance, 0.002);
   nh.param<double>("common/auto_exit_idle_sec", auto_exit_idle_sec, 0.0);
 
   nh.param<bool>("vio/normal_en", normal_en, true);
@@ -64,6 +67,9 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<double>("vio/img_point_cov", IMG_POINT_COV, 100);
   nh.param<bool>("vio/raycast_en", raycast_en, false);
   nh.param<bool>("vio/exposure_estimate_en", exposure_estimate_en, true);
+  nh.param<bool>("vio/exposure_per_camera", exposure_per_camera, true);
+  nh.param<bool>("vio/exposure_regauge", exposure_regauge, false);
+  nh.param<bool>("vio/vignetting_color_only", vignetting_color_only, false);
   nh.param<double>("vio/inv_expo_cov", inv_expo_cov, 0.2);
   nh.param<int>("vio/grid_size", grid_size, 5);
   nh.param<int>("vio/grid_n_height", grid_n_height, 17);
@@ -105,6 +111,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
 
   nh.param<bool>("pcd_save/colmap_output_en", colmap_output_en, false);
   nh.param<bool>("pcd_save/lidar_map_en", lidar_map_en, false);
+  nh.param<bool>("publish/color_expo_norm", color_expo_norm, false);
   nh.param<double>("pcd_save/filter_size_pcd", filter_size_pcd, 0.5);
   nh.param<vector<double>>("extrin_calib/extrinsic_T", extrinT, vector<double>());
   nh.param<vector<double>>("extrin_calib/extrinsic_R", extrinR, vector<double>());
@@ -130,13 +137,12 @@ void LIVMapper::initializeComponents()
   voxelmap_manager->extT_ << VEC_FROM_ARRAY(extrinT);
   voxelmap_manager->extR_ << MAT_FROM_ARRAY(extrinR);
 
-  if (!vk::camera_loader::loadFromRosNs("laserMapping", vio_manager->cam)) throw std::runtime_error("Camera model not correctly specified.");
+  loadCameras();
 
   vio_manager->grid_size = grid_size;
   vio_manager->patch_size = patch_size;
   vio_manager->outlier_threshold = outlier_threshold;
   vio_manager->setImuToLidarExtrinsic(extT, extR);
-  vio_manager->setLidarToCameraExtrinsic(cameraextrinR, cameraextrinT);
   vio_manager->state = &_state;
   vio_manager->state_propagat = &state_propagat;
   vio_manager->max_iterations = max_iterations;
@@ -148,6 +154,9 @@ void LIVMapper::initializeComponents()
   vio_manager->grid_n_height = grid_n_height;
   vio_manager->patch_pyrimid_level = patch_pyrimid_level;
   vio_manager->exposure_estimate_en = exposure_estimate_en;
+  vio_manager->exposure_per_camera = exposure_per_camera;
+  vio_manager->exposure_regauge = exposure_regauge;
+  vio_manager->vignetting_color_only = vignetting_color_only;
   vio_manager->colmap_output_en = colmap_output_en;
   vio_manager->initializeVIO();
 
@@ -158,6 +167,7 @@ void LIVMapper::initializeComponents()
   p_imu->set_gyr_bias_cov(V3D(0.0001, 0.0001, 0.0001));
   p_imu->set_acc_bias_cov(V3D(0.0001, 0.0001, 0.0001));
   p_imu->set_imu_init_frame_num(imu_int_frame);
+  p_imu->extra_expo_num = (exposure_estimate_en && exposure_per_camera) ? num_cams - 1 : 0;
 
   if (!imu_en) p_imu->disable_imu();
   if (!gravity_est_en) p_imu->disable_gravity_est();
@@ -165,6 +175,50 @@ void LIVMapper::initializeComponents()
   if (!exposure_estimate_en) p_imu->disable_exposure_est();
 
   slam_mode_ = (img_en && lidar_en) ? LIVO : imu_en ? ONLY_LIO : ONLY_LO;
+}
+
+void LIVMapper::loadCameras()
+{
+  if (img_topics.empty())
+  {
+    // Single camera: model in the node namespace, extrinsic in extrin_calib/Rcl, Pcl.
+    num_cams = 1;
+    if (!vk::camera_loader::loadFromRosNs("laserMapping", vio_manager->cam)) throw std::runtime_error("Camera model not correctly specified.");
+    vio_manager->setLidarToCameraExtrinsic(cameraextrinR, cameraextrinT);
+    return;
+  }
+
+  // Camera rig: camera i in the node namespace cam<i> (model as vikit expects it plus Rcl, Pcl, time_offset,
+  // max_incidence_deg, mask_file, vignetting), image topic common/img_topics[i].
+  num_cams = img_topics.size();
+  if (num_cams > MAX_CAMS) throw std::runtime_error("More cameras than MAX_CAMS");
+  for (int i = 0; i < num_cams; i++)
+  {
+    const std::string ns = "laserMapping/cam" + std::to_string(i);
+    vk::AbstractCamera *camera = nullptr;
+    if (!vk::camera_loader::loadFromRosNs(ns, camera)) throw std::runtime_error("Camera model of " + ns + " not correctly specified.");
+    vector<double> R_cl, P_cl;
+    double time_offset, max_incidence_deg;
+    std::string mask_file;
+    ros::param::param<vector<double>>(ns + "/Rcl", R_cl, vector<double>());
+    ros::param::param<vector<double>>(ns + "/Pcl", P_cl, vector<double>());
+    ros::param::param<double>(ns + "/time_offset", time_offset, 0.0);
+    ros::param::param<double>(ns + "/max_incidence_deg", max_incidence_deg, 90.0);
+    ros::param::param<std::string>(ns + "/mask_file", mask_file, "");
+    vector<double> vignetting;
+    ros::param::param<vector<double>>(ns + "/vignetting", vignetting, vector<double>());
+    if (R_cl.size() != 9 || P_cl.size() != 3) throw std::runtime_error(ns + "/Rcl (9 values) and " + ns + "/Pcl (3 values) are required");
+    cv::Mat mask;
+    if (!mask_file.empty())
+    {
+      mask = cv::imread(mask_file, cv::IMREAD_GRAYSCALE);
+      if (mask.empty()) throw std::runtime_error("Cannot read camera mask " + mask_file);
+      if (mask.cols != camera->width() || mask.rows != camera->height())
+        cv::resize(mask, mask, cv::Size(camera->width(), camera->height()), 0, 0, cv::INTER_NEAREST);
+    }
+    vio_manager->addCamera(camera, R_cl, P_cl, time_offset, max_incidence_deg, mask, vignetting);
+    ROS_INFO("Camera %d: topic %s, %dx%d", i, img_topics[i].c_str(), camera->width(), camera->height());
+  }
 }
 
 void LIVMapper::initializeFiles() 
@@ -200,7 +254,20 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
             nh.subscribe(lid_topic, 200000, &LIVMapper::livox_pcl_cbk, this): 
             nh.subscribe(lid_topic, 200000, &LIVMapper::standard_pcl_cbk, this);
   sub_imu = nh.subscribe(imu_topic, 200000, &LIVMapper::imu_cbk, this);
-  sub_img = nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
+  if (img_topics.empty())
+  {
+    sub_img = nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
+  }
+  else
+  {
+    // Image callbacks run in their own threads so that they do not stall the estimator.
+    ros::NodeHandle nh_img;
+    nh_img.setCallbackQueue(&img_callback_queue);
+    for (int i = 0; i < num_cams; i++)
+      sub_imgs.push_back(nh_img.subscribe<sensor_msgs::Image>(img_topics[i], 1000, boost::bind(&LIVMapper::img_multi_cbk, this, _1, i)));
+    img_spinner.reset(new ros::AsyncSpinner(num_cams, &img_callback_queue));
+    img_spinner->start();
+  }
   
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
   pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
@@ -288,7 +355,7 @@ void LIVMapper::handleVIO()
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_pre << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
-            << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << std::endl;
+            << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, _state.invExpo(std::min(1, MAX_CAMS - 1)), 0).transpose() << std::endl;
     
   if (pcl_w_wait_pub->empty() || (pcl_w_wait_pub == nullptr)) 
   {
@@ -307,7 +374,9 @@ void LIVMapper::handleVIO()
     vio_manager->plot_flag = false;
   }
 
-  vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
+  vio_manager->omega_imu = p_imu->getLastAngVel();
+  vio_manager->vel_world = _state.vel_end;
+  vio_manager->processFrame(LidarMeasures.measures.back().imgs, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
 
   if (imu_prop_enable) 
   {
@@ -336,7 +405,8 @@ void LIVMapper::handleVIO()
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
-            << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
+            << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, _state.invExpo(std::min(1, MAX_CAMS - 1)), 0).transpose() << " "
+            << feats_undistort->points.size() << std::endl;
 }
 
 void LIVMapper::writeEvoPose()
@@ -913,7 +983,7 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   }
 
   cv::Mat img_cur = getImageFromMsg(msg);
-  img_buffer.push_back(img_cur);
+  img_buffer.push_back(std::vector<cv::Mat>{img_cur});
   img_time_buffer.push_back(img_time_correct);
 
   // ROS_INFO("Correct Image time: %.6f", img_time_correct);
@@ -924,6 +994,69 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   // cout<<"last_timestamp_img:::"<<last_timestamp_img<<endl;
   mtx_buffer.unlock();
   sig_buffer.notify_all();
+}
+
+void LIVMapper::img_multi_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_idx)
+{
+  if (!img_en || last_timestamp_lidar < 0) return;
+  cv::Mat img = getImageFromMsg(msg_in);
+  if (img_decode_reduce > 1) cv::resize(img, img, cv::Size(img.cols / img_decode_reduce, img.rows / img_decode_reduce), 0, 0, cv::INTER_AREA);
+  mtx_buffer.lock();
+  pushCameraImage(msg_in->header.stamp.toSec() + img_time_offset, cam_idx, img);
+  mtx_buffer.unlock();
+  sig_buffer.notify_all();
+}
+
+void LIVMapper::pushCameraImage(double stamp, int cam_idx, const cv::Mat &img)
+{
+  // Caller holds mtx_buffer.
+  if (stamp <= last_timestamp_img + 1e-6)
+  {
+    ROS_WARN("Camera %d: image at %.6f is not newer than the last frame (%.6f), dropped", cam_idx, stamp, last_timestamp_img);
+    return;
+  }
+  auto it = pending_frames.end();
+  for (auto p = pending_frames.begin(); p != pending_frames.end(); ++p)
+  {
+    if (fabs(p->second.time - stamp) < img_sync_tolerance)
+    {
+      it = p;
+      break;
+    }
+  }
+  if (it == pending_frames.end())
+  {
+    PendingFrame f;
+    f.time = stamp;
+    f.imgs.resize(num_cams);
+    f.count = 0;
+    it = pending_frames.emplace(std::llround(stamp * 1e6), f).first;
+  }
+  if (!it->second.imgs[cam_idx].empty())
+  {
+    ROS_WARN("Camera %d: duplicate image at %.6f, dropped", cam_idx, stamp);
+    return;
+  }
+  it->second.imgs[cam_idx] = img;
+  it->second.count++;
+
+  // Release frames in time order: complete ones, and incomplete ones that can no longer be completed.
+  const double newest = pending_frames.rbegin()->second.time;
+  while (!pending_frames.empty())
+  {
+    PendingFrame &f = pending_frames.begin()->second;
+    const bool complete = f.count == num_cams;
+    if (!complete && newest - f.time < img_incomplete_timeout) break;
+    if (!complete)
+    {
+      incomplete_frames++;
+      ROS_WARN("Frame at %.6f has %d of %d camera images (%d incomplete frames so far)", f.time, f.count, num_cams, incomplete_frames);
+    }
+    img_buffer.push_back(f.imgs);
+    img_time_buffer.push_back(f.time);
+    last_timestamp_img = f.time;
+    pending_frames.erase(pending_frames.begin());
+  }
 }
 
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
@@ -1098,7 +1231,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       struct MeasureGroup m;
       m.vio_time = img_capture_time;
       m.lio_time = meas.last_lio_update_time;
-      m.img = img_buffer.front();
+      m.imgs = img_buffer.front();
       mtx_buffer.lock();
       // while ((!imu_buffer.empty() && (imu_time < img_capture_time)))
       // {
@@ -1165,7 +1298,16 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 
 void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager)
 {
-  cv::Mat img_rgb = vio_manager->img_cp;
+  // All cameras side by side (black for a camera without image in this frame).
+  std::vector<cv::Mat> tiles;
+  for (const auto &cc : vio_manager->cams)
+  {
+    if (cc.frame && !cc.img_cp.empty()) tiles.push_back(cc.img_cp);
+    else tiles.push_back(cv::Mat::zeros(vio_manager->height, vio_manager->width, CV_8UC3));
+  }
+  if (tiles.empty() || tiles[0].channels() != 3) return;
+  cv::Mat img_rgb;
+  cv::hconcat(tiles, img_rgb);
   cv_bridge::CvImage out_msg;
   out_msg.header.stamp = ros::Time::now();
   // out_msg.header.frame_id = "camera_init";
@@ -1192,7 +1334,6 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
       size_t size = pcl_wait_pub->points.size();
       laserCloudWorldRGB->reserve(size);
       // double inv_expo = _state.inv_expo_time;
-      cv::Mat img_rgb = vio_manager->img_rgb;
       for (size_t i = 0; i < size; i++)
       {
         PointTypeRGB pointRGB;
@@ -1201,15 +1342,20 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
         pointRGB.z = pcl_wait_pub->points[i].z;
 
         V3D p_w(pcl_wait_pub->points[i].x, pcl_wait_pub->points[i].y, pcl_wait_pub->points[i].z);
-        V3D pf(vio_manager->new_frame_->w2f(p_w)); if (pf[2] < 0) continue;
-        V2D pc(vio_manager->new_frame_->w2c(p_w));
-
-        if (vio_manager->new_frame_->cam_->isInFrame(pc.cast<int>(), 3)) // 100
+        // color from the camera that sees the point closest to its optical axis
+        V2D pc;
+        const int cam_id = vio_manager->bestCameraForPoint(p_w, pc, 3);
+        if (cam_id >= 0)
         {
-          V3F pixel = vio_manager->getInterpolatedPixel(img_rgb, pc);
+          const CameraContext &cc = vio_manager->cams[cam_id];
+          if (cc.img_rgb.channels() != 3) continue;
+          V3D pf(cc.frame->w2f(p_w));
+          V3F pixel = vio_manager->getInterpolatedPixel(cc.img_rgb, pc);
+          if (color_expo_norm) pixel = (pixel * static_cast<float>(_state.invExpo(vio_manager->expoGroup(cam_id)))).cwiseMin(255.0f);
           pointRGB.r = pixel[2];
           pointRGB.g = pixel[1];
           pointRGB.b = pixel[0];
+          pointRGB.a = static_cast<uint8_t>(cam_id + 1); // camera of this observation, kept in the (unused) alpha byte
           // pointRGB.r = pixel[2] * inv_expo; pointRGB.g = pixel[1] * inv_expo; pointRGB.b = pixel[0] * inv_expo;
           // if (pointRGB.r > 255) pointRGB.r = 255; else if (pointRGB.r < 0) pointRGB.r = 0;
           // if (pointRGB.g > 255) pointRGB.g = 255; else if (pointRGB.g < 0) pointRGB.g = 0;
@@ -1321,7 +1467,12 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
 
     if (img_save_interval > 0 && img_wait_num >= img_save_interval)
     {
-      imwrite(string(string(ROOT_DIR) + "Log/image/") + ss_time.str() + string(".png"), vio_manager->img_rgb);
+      for (const auto &cc : vio_manager->cams)
+      {
+        if (!cc.frame) continue;
+        const std::string suffix = vio_manager->cams.size() > 1 ? "_cam" + std::to_string(cc.id) : "";
+        imwrite(string(string(ROOT_DIR) + "Log/image/") + ss_time.str() + suffix + string(".png"), cc.img_rgb);
+      }
       
       Eigen::Quaterniond q(_state.rot_end);
       fout_visual_pos << std::fixed << std::setprecision(6);

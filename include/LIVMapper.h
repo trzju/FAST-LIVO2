@@ -19,7 +19,10 @@ which is included as part of this source code package.
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
+#include <ros/callback_queue.h>
+#include <ros/spinner.h>
 #include <vikit/camera_loader.h>
+#include <map>
 
 class LIVMapper
 {
@@ -49,6 +52,9 @@ public:
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
+  void img_multi_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_idx);
+  void pushCameraImage(double stamp, int cam_idx, const cv::Mat &img);
+  void loadCameras();
   void writeEvoPose();
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
@@ -71,6 +77,24 @@ public:
   
   string root_dir;
   string lid_topic, imu_topic, seq_name, img_topic;
+
+  // Multi-camera input. Images of all cameras with (almost) the same stamp form one VIO frame.
+  struct PendingFrame
+  {
+    double time;
+    std::vector<cv::Mat> imgs;
+    int count;
+  };
+  int num_cams = 1;
+  vector<string> img_topics;              // one topic per camera; empty: single camera on img_topic
+  int img_decode_reduce = 1;              // 1, 2, 4 or 8: decode / downsample images by this factor on arrival
+  double img_sync_tolerance = 0.002;      // s, images closer than this belong to the same frame
+  double img_incomplete_timeout = 0.3;    // s, a frame still missing a camera after this is used with the others
+  std::map<long long, PendingFrame> pending_frames;
+  int incomplete_frames = 0;
+  ros::CallbackQueue img_callback_queue;
+  std::unique_ptr<ros::AsyncSpinner> img_spinner;
+  vector<ros::Subscriber> sub_imgs;
   double auto_exit_idle_sec = 0.0;        // >0: leave the main loop (and save the map) when no data arrived for this long
   V3D extT;
   M3D extR;
@@ -110,6 +134,9 @@ public:
   int img_en = 1, imu_int_frame = 3;
   bool normal_en = true;
   bool exposure_estimate_en = false;
+  bool exposure_per_camera = true;
+  bool exposure_regauge = false;
+  bool vignetting_color_only = false;
   double exposure_time_init = 0.0;
   bool inverse_composition_en = false;
   bool raycast_en = false;
@@ -123,7 +150,7 @@ public:
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;
   deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
-  deque<cv::Mat> img_buffer;
+  deque<std::vector<cv::Mat>> img_buffer;
   deque<double> img_time_buffer;
   vector<pointWithVar> _pv_list;
   vector<double> extrinT;
@@ -142,6 +169,7 @@ public:
   PointCloudXYZI::Ptr pcl_wait_save_intensity;
   PointCloudXYZI::Ptr pcl_wait_save_lidar;  // LIVO: every LiDAR point (not only the ones a camera sees), saved as all_lidar_points.pcd
   bool lidar_map_en = false;
+  bool color_expo_norm = false;             // multiply map colors by the camera's estimated inverse exposure time
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
 
