@@ -1,0 +1,16 @@
+<launch>
+<!-- MetaCam (MID-360 + two fisheye cameras), parameters from scripts/gen_metacam_config.py -->
+
+	<arg name="rviz" default="false" />
+	<arg name="config" default="metacam" />
+
+	<rosparam command="load" file="$(find fast_livo)/config/$(arg config).yaml" />
+
+	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen" required="true">
+		<rosparam file="$(find fast_livo)/config/$(arg config)_cameras.yaml" />
+	</node>
+
+	<group if="$(arg rviz)">
+		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
+	</group>
+</launch>
