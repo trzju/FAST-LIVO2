@@ -31,8 +31,11 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|aarch64|ARM|AARCH64)")
   add_definitions(-DARM_ARCH)
 else()
   # x86-64 (Intel/AMD) optimizations
-  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -mtune=native -funroll-loops") #-flto
-  message(STATUS "Using general x86 optimizations: -O3 -march=native -mtune=native -funroll-loops") 
+  # -mno-avx: with AVX, Eigen aligns heap memory to 32 bytes with its own allocator, while the distribution PCL is built
+  # for 16 bytes (plain malloc); point clouds allocated inside PCL (e.g. VoxelGrid outputs) then crash when they are
+  # freed here (heap-buffer-overflow in handmade_aligned_free, seen at shutdown).
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -mtune=native -mno-avx -funroll-loops") #-flto
+  message(STATUS "Using general x86 optimizations: -O3 -march=native -mtune=native -mno-avx -funroll-loops") 
   add_definitions(-DX86_ARCH)
 endif()
 
