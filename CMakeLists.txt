@@ -101,6 +101,7 @@ find_package(PCL REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Sophus REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread)
+find_package(JPEG REQUIRED)
 
 set(Sophus_LIBRARIES libSophus.so)
 
@@ -117,6 +118,7 @@ include_directories(
   ${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${Sophus_INCLUDE_DIRS}
+  ${JPEG_INCLUDE_DIR}
   include
 )
 
@@ -126,6 +128,8 @@ add_library(lio src/voxel_map.cpp)
 add_library(pre src/preprocess.cpp)
 add_library(imu_proc src/IMU_Processing.cpp)
 add_library(laser_mapping src/LIVMapper.cpp)
+
+target_link_libraries(laser_mapping ${JPEG_LIBRARIES})
 
 # Add the main executable
 add_executable(fastlivo_mapping src/main.cpp)
@@ -142,6 +146,7 @@ target_link_libraries(fastlivo_mapping
   ${OpenCV_LIBRARIES}
   ${Sophus_LIBRARIES}
   ${Boost_LIBRARIES}
+  ${JPEG_LIBRARIES}
 )
 
 # Link mimalloc if found

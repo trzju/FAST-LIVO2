@@ -19,6 +19,7 @@ which is included as part of this source code package.
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
+#include <sensor_msgs/CompressedImage.h>
 #include <ros/callback_queue.h>
 #include <ros/spinner.h>
 #include <vikit/camera_loader.h>
@@ -53,6 +54,7 @@ public:
   void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
   void img_multi_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_idx);
+  void img_compressed_cbk(const sensor_msgs::CompressedImageConstPtr &msg_in, int cam_idx);
   void pushCameraImage(double stamp, int cam_idx, const cv::Mat &img);
   void loadCameras();
   void writeEvoPose();
@@ -87,6 +89,7 @@ public:
   };
   int num_cams = 1;
   vector<string> img_topics;              // one topic per camera; empty: single camera on img_topic
+  bool img_compressed = false;            // sensor_msgs/CompressedImage (JPEG) instead of sensor_msgs/Image
   int img_decode_reduce = 1;              // 1, 2, 4 or 8: decode / downsample images by this factor on arrival
   double img_sync_tolerance = 0.002;      // s, images closer than this belong to the same frame
   double img_incomplete_timeout = 0.3;    // s, a frame still missing a camera after this is used with the others

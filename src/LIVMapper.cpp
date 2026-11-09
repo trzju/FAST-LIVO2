@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
+#include "jpeg_decode.h"
 
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
@@ -57,6 +58,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("common/lidar_en", lidar_en, 1);
   nh.param<string>("common/img_topic", img_topic, "/left_camera/image");
   nh.param<vector<string>>("common/img_topics", img_topics, vector<string>());
+  nh.param<bool>("common/img_compressed", img_compressed, false);
   nh.param<int>("common/img_decode_reduce", img_decode_reduce, 1);
   nh.param<double>("common/img_sync_tolerance", img_sync_tolerance, 0.002);
   nh.param<double>("common/auto_exit_idle_sec", auto_exit_idle_sec, 0.0);
@@ -260,11 +262,16 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   }
   else
   {
-    // Image callbacks run in their own threads so that they do not stall the estimator.
+    // Image callbacks (JPEG decoding) run in their own threads so that they do not stall the estimator.
     ros::NodeHandle nh_img;
     nh_img.setCallbackQueue(&img_callback_queue);
     for (int i = 0; i < num_cams; i++)
-      sub_imgs.push_back(nh_img.subscribe<sensor_msgs::Image>(img_topics[i], 1000, boost::bind(&LIVMapper::img_multi_cbk, this, _1, i)));
+    {
+      if (img_compressed)
+        sub_imgs.push_back(nh_img.subscribe<sensor_msgs::CompressedImage>(img_topics[i], 1000, boost::bind(&LIVMapper::img_compressed_cbk, this, _1, i)));
+      else
+        sub_imgs.push_back(nh_img.subscribe<sensor_msgs::Image>(img_topics[i], 1000, boost::bind(&LIVMapper::img_multi_cbk, this, _1, i)));
+    }
     img_spinner.reset(new ros::AsyncSpinner(num_cams, &img_callback_queue));
     img_spinner->start();
   }
@@ -1001,6 +1008,39 @@ void LIVMapper::img_multi_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_
   if (!img_en || last_timestamp_lidar < 0) return;
   cv::Mat img = getImageFromMsg(msg_in);
   if (img_decode_reduce > 1) cv::resize(img, img, cv::Size(img.cols / img_decode_reduce, img.rows / img_decode_reduce), 0, 0, cv::INTER_AREA);
+  mtx_buffer.lock();
+  pushCameraImage(msg_in->header.stamp.toSec() + img_time_offset, cam_idx, img);
+  mtx_buffer.unlock();
+  sig_buffer.notify_all();
+}
+
+void LIVMapper::img_compressed_cbk(const sensor_msgs::CompressedImageConstPtr &msg_in, int cam_idx)
+{
+  if (!img_en || last_timestamp_lidar < 0) return;
+  // JPEG decoding at reduced resolution (DCT scaling) is much cheaper than decoding the 12 MP image and resizing.
+  cv::Mat img;
+  const bool is_jpeg = msg_in->data.size() > 2 && msg_in->data[0] == 0xFF && msg_in->data[1] == 0xD8;
+  if (is_jpeg && (img_decode_reduce == 1 || img_decode_reduce == 2 || img_decode_reduce == 4 || img_decode_reduce == 8))
+  {
+    img = jpeg_decode::decodeBGR(msg_in->data.data(), msg_in->data.size(), img_decode_reduce);
+  }
+  else
+  {
+    img = cv::imdecode(msg_in->data, cv::IMREAD_COLOR);
+    if (!img.empty() && img_decode_reduce > 1)
+      cv::resize(img, img, cv::Size(img.cols / img_decode_reduce, img.rows / img_decode_reduce), 0, 0, cv::INTER_AREA);
+  }
+  if (img.empty())
+  {
+    ROS_ERROR("Camera %d: cannot decode compressed image (format %s)", cam_idx, msg_in->format.c_str());
+    return;
+  }
+  const vk::AbstractCamera *camera = vio_manager->cams[cam_idx].cam;
+  if (img.cols != camera->width() || img.rows != camera->height())
+  {
+    ROS_WARN_ONCE("Camera %d: decoded image is %dx%d, camera model %dx%d: resizing", cam_idx, img.cols, img.rows, camera->width(), camera->height());
+    cv::resize(img, img, cv::Size(camera->width(), camera->height()), 0, 0, cv::INTER_AREA);
+  }
   mtx_buffer.lock();
   pushCameraImage(msg_in->header.stamp.toSec() + img_time_offset, cam_idx, img);
   mtx_buffer.unlock();
