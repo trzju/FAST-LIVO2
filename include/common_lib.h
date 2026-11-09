@@ -27,7 +27,8 @@ using namespace Sophus;
 
 #define print_line std::cout << __FILE__ << ", " << __LINE__ << std::endl;
 #define G_m_s2 (9.81)   // Gravaty const in GuangDong/China
-#define DIM_STATE (19)  // Dimension of states (Let Dim(SO(3)) = 3)
+#define MAX_CAMS (2)    // Maximum number of cameras (one inverse exposure state each)
+#define DIM_STATE (18 + MAX_CAMS)  // Dimension of states (Let Dim(SO(3)) = 3)
 #define INIT_COV (0.01)
 #define SIZE_LARGE (500)
 #define SIZE_SMALL (100)
@@ -135,9 +136,11 @@ struct StatesGroup
     this->bias_a = V3D::Zero();
     this->gravity = V3D::Zero();
     this->inv_expo_time = 1.0;
+    for (int i = 0; i < MAX_CAMS - 1; i++) this->inv_expo_extra[i] = 1.0;
     this->cov = MD(DIM_STATE, DIM_STATE)::Identity() * INIT_COV;
     this->cov(6, 6) = 0.00001;
     this->cov.block<9, 9>(10, 10) = MD(9, 9)::Identity() * 0.00001;
+    for (int i = 19; i < DIM_STATE; i++) this->cov(i, i) = 0.00001;
   };
 
   StatesGroup(const StatesGroup &b)
@@ -149,6 +152,7 @@ struct StatesGroup
     this->bias_a = b.bias_a;
     this->gravity = b.gravity;
     this->inv_expo_time = b.inv_expo_time;
+    for (int i = 0; i < MAX_CAMS - 1; i++) this->inv_expo_extra[i] = b.inv_expo_extra[i];
     this->cov = b.cov;
   };
 
@@ -161,6 +165,7 @@ struct StatesGroup
     this->bias_a = b.bias_a;
     this->gravity = b.gravity;
     this->inv_expo_time = b.inv_expo_time;
+    for (int i = 0; i < MAX_CAMS - 1; i++) this->inv_expo_extra[i] = b.inv_expo_extra[i];
     this->cov = b.cov;
     return *this;
   };
@@ -175,6 +180,7 @@ struct StatesGroup
     a.bias_g = this->bias_g + state_add.block<3, 1>(10, 0);
     a.bias_a = this->bias_a + state_add.block<3, 1>(13, 0);
     a.gravity = this->gravity + state_add.block<3, 1>(16, 0);
+    for (int i = 0; i < MAX_CAMS - 1; i++) a.inv_expo_extra[i] = this->inv_expo_extra[i] + state_add(19 + i, 0);
 
     a.cov = this->cov;
     return a;
@@ -189,6 +195,7 @@ struct StatesGroup
     this->bias_g += state_add.block<3, 1>(10, 0);
     this->bias_a += state_add.block<3, 1>(13, 0);
     this->gravity += state_add.block<3, 1>(16, 0);
+    for (int i = 0; i < MAX_CAMS - 1; i++) this->inv_expo_extra[i] += state_add(19 + i, 0);
     return *this;
   };
 
@@ -203,8 +210,15 @@ struct StatesGroup
     a.block<3, 1>(10, 0) = this->bias_g - b.bias_g;
     a.block<3, 1>(13, 0) = this->bias_a - b.bias_a;
     a.block<3, 1>(16, 0) = this->gravity - b.gravity;
+    for (int i = 0; i < MAX_CAMS - 1; i++) a(19 + i, 0) = this->inv_expo_extra[i] - b.inv_expo_extra[i];
     return a;
   };
+
+  /// Inverse exposure time of exposure group `cam` (0 is the original state at index 6).
+  double &invExpo(int cam) { return cam == 0 ? inv_expo_time : inv_expo_extra[cam - 1]; }
+  double invExpo(int cam) const { return cam == 0 ? inv_expo_time : inv_expo_extra[cam - 1]; }
+  /// Index of that inverse exposure time in the error state.
+  static int expoIndex(int cam) { return cam == 0 ? 6 : 18 + cam; }
 
   void resetpose()
   {
@@ -216,7 +230,8 @@ struct StatesGroup
   M3D rot_end;                              // the estimated attitude (rotation matrix) at the end lidar point
   V3D pos_end;                              // the estimated position at the end lidar point (world frame)
   V3D vel_end;                              // the estimated velocity at the end lidar point (world frame)
-  double inv_expo_time;                     // the estimated inverse exposure time (no scale)
+  double inv_expo_time;                     // the estimated inverse exposure time (no scale) of camera 0
+  double inv_expo_extra[MAX_CAMS - 1];      // inverse exposure time of cameras 1.. (state index 19..)
   V3D bias_g;                               // gyroscope bias
   V3D bias_a;                               // accelerator bias
   V3D gravity;                              // the estimated gravity acceleration

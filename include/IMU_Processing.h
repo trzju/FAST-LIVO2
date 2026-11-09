@@ -47,6 +47,8 @@ public:
   void disable_exposure_est();
   void Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, PointCloudXYZI::Ptr cur_pcl_un_);
   void UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out);
+  /// Bias-corrected angular velocity (IMU frame) of the last propagated IMU sample.
+  V3D getLastAngVel() const { return angvel_last; }
 
   ofstream fout_imu;
   double IMU_mean_acc_norm;
@@ -57,6 +59,7 @@ public:
   V3D cov_bias_gyr;
   V3D cov_bias_acc;
   double cov_inv_expo;
+  int extra_expo_num = 0; // inverse exposure states of cameras 1.. (state index 19..) that receive process noise
   double first_lidar_time;
   bool imu_time_init = false;
   bool imu_need_init = true;
