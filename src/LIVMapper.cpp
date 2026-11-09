@@ -92,6 +92,8 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("preprocess/scan_line", p_pre->N_SCANS, 6);
   nh.param<int>("preprocess/point_filter_num", p_pre->point_filter_num, 3);
   nh.param<bool>("preprocess/feature_extract_enabled", p_pre->feature_enabled, false);
+  nh.param<bool>("preprocess/livox_tag_filter", p_pre->livox_tag_filter, false);
+  nh.param<vector<double>>("preprocess/self_filter_box", p_pre->self_filter_box, vector<double>());
 
   nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
   nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);

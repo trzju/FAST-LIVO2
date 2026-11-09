@@ -43,7 +43,8 @@ enum LID_TYPE
   L515 = 4,
   XT32 = 5,
   PANDAR128 = 6,
-  ROBOSENSE = 7
+  ROBOSENSE = 7,
+  LIVOX_PC2 = 8 // Livox PointCloud2 (livox_ros_driver2 xfer_format 0), e.g. MetaCam MID-360
 };
 enum SLAM_MODE
 {

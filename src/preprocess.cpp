@@ -85,6 +85,10 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointClo
     robosense_handler(msg);
     break;
 
+  case LIVOX_PC2:
+    livox_pc2_handler(msg);
+    break;
+
   default:
     printf("Error LiDAR Type: %d \n", lidar_type);
     break;
@@ -165,7 +169,19 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
   {
     for (uint i = 0; i < plsize; i++)
     {
-      if ((msg->points[i].line < N_SCANS)) // && ((msg->points[i].tag & 0x30) == 0x10))
+      // time of every point, also of the dropped ones: the jump check compares with the previous point
+      pl_full[i].curvature = msg->points[i].offset_time / float(1000000); // use curvature as time of each laser points
+      if (i == 0)
+        pl_full[i].curvature = fabs(pl_full[i].curvature) < 1.0 ? pl_full[i].curvature : 0.0;
+      else
+      {
+        // if(fabs(pl_full[i].curvature - pl_full[i - 1].curvature) > 1.0) ROS_ERROR("time jump: %f", fabs(pl_full[i].curvature - pl_full[i - 1].curvature));
+        pl_full[i].curvature = fabs(pl_full[i].curvature - pl_full[i - 1].curvature) < 1.0
+                                   ? pl_full[i].curvature
+                                   : pl_full[i - 1].curvature + 0.004166667f; // float(100/24000)
+      }
+      // livox_tag_filter: drop points flagged as spatial or intensity noise (tag bits 0-3), as in livox_pc2_handler
+      if ((msg->points[i].line < N_SCANS) && !(livox_tag_filter && (msg->points[i].tag & 0x0F))) // && ((msg->points[i].tag & 0x30) == 0x10))
       {
         valid_num++;
 
@@ -173,17 +189,6 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
         pl_full[i].y = msg->points[i].y;
         pl_full[i].z = msg->points[i].z;
         pl_full[i].intensity = msg->points[i].reflectivity;
-        pl_full[i].curvature = msg->points[i].offset_time / float(1000000); // use curvature as time of each laser points
-
-        if (i == 0)
-          pl_full[i].curvature = fabs(pl_full[i].curvature) < 1.0 ? pl_full[i].curvature : 0.0;
-        else
-        {
-          // if(fabs(pl_full[i].curvature - pl_full[i - 1].curvature) > 1.0) ROS_ERROR("time jump: %f", fabs(pl_full[i].curvature - pl_full[i - 1].curvature));
-          pl_full[i].curvature = fabs(pl_full[i].curvature - pl_full[i - 1].curvature) < 1.0
-                                     ? pl_full[i].curvature
-                                     : pl_full[i - 1].curvature + 0.004166667f; // float(100/24000)
-        }
 
         if (valid_num % point_filter_num == 0)
         {
@@ -741,6 +746,52 @@ void Preprocess::robosense_handler(const sensor_msgs::PointCloud2::ConstPtr &msg
   std::sort(pl_surf.points.begin(), pl_surf.points.end(), [](const PointType &a, const PointType &b) {
     return a.curvature < b.curvature;
   });
+}
+
+bool Preprocess::inSelfFilterBox(double x, double y, double z) const
+{
+  if (self_filter_box.size() != 6) return false;
+  return x > self_filter_box[0] && x < self_filter_box[1] && y > self_filter_box[2] && y < self_filter_box[3] && z > self_filter_box[4] &&
+         z < self_filter_box[5];
+}
+
+void Preprocess::livox_pc2_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+{
+  pl_surf.clear();
+
+  pcl::PointCloud<livox_pc2_ros::Point> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  int plsize = pl_orig.size();
+  pl_surf.reserve(plsize / std::max(point_filter_num, 1) + 1);
+
+  // Point stamps are absolute (ns); offsets are taken w.r.t. the message stamp (scan start).
+  const double time_head_ns = static_cast<double>(msg->header.stamp.toNSec());
+  uint valid_num = 0;
+  for (int i = 0; i < plsize; ++i)
+  {
+    const auto &pt = pl_orig.points[i];
+    if (pt.line >= N_SCANS) continue;
+    if (livox_tag_filter && (pt.tag & 0x0F) != 0) continue;
+    const double x = pt.x, y = pt.y, z = pt.z;
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+
+    valid_num++;
+    if (valid_num % point_filter_num != 0) continue;
+    if (x * x + y * y + z * z < blind_sqr) continue;
+    if (inSelfFilterBox(x, y, z)) continue;
+
+    PointType added_pt;
+    added_pt.normal_x = 0;
+    added_pt.normal_y = 0;
+    added_pt.normal_z = 0;
+    added_pt.x = pt.x;
+    added_pt.y = pt.y;
+    added_pt.z = pt.z;
+    added_pt.intensity = pt.intensity;
+    added_pt.curvature = (pt.timestamp - time_head_ns) * 1e-6; // ms
+    pl_surf.points.push_back(added_pt);
+  }
+  std::stable_sort(pl_surf.points.begin(), pl_surf.points.end(), [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
 }
 
 void Preprocess::give_feature(pcl::PointCloud<PointType> &pl, vector<orgtype> &types)

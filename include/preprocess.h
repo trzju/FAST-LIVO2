@@ -147,6 +147,23 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(robosense_ros::Point,
                                   (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(double, timestamp, timestamp)(std::uint16_t, ring, ring))
 /*****************/
 
+/*** Livox PointCloud2 (livox_ros_driver2, xfer_format 0), e.g. MID-360 in MetaCam bags ***/
+namespace livox_pc2_ros
+{
+struct EIGEN_ALIGN16 Point
+{
+  PCL_ADD_POINT4D;
+  float intensity;
+  std::uint8_t tag;
+  std::uint8_t line;
+  double timestamp; // absolute, ns
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+} // namespace livox_pc2_ros
+POINT_CLOUD_REGISTER_POINT_STRUCT(livox_pc2_ros::Point, (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(std::uint8_t, tag, tag)(
+                                                            std::uint8_t, line, line)(double, timestamp, timestamp))
+/*****************/
+
 class Preprocess
 {
 public:
@@ -167,6 +184,10 @@ public:
   
   double blind, blind_sqr;
   bool feature_enabled, given_offset_time;
+  // LIVOX_PC2: drop points whose tag flags them as noise (bits 0-3 non-zero)
+  bool livox_tag_filter = false;
+  // Points inside this box (sensor frame, [x_min x_max y_min y_max z_min z_max]) are removed, e.g. the operator
+  std::vector<double> self_filter_box;
   ros::Publisher pub_full, pub_surf, pub_corn;
 
 private:
@@ -176,6 +197,8 @@ private:
   void xt32_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void Pandar128_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void robosense_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
+  void livox_pc2_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
+  bool inSelfFilterBox(double x, double y, double z) const;
   void l515_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void give_feature(PointCloudXYZI &pl, vector<orgtype> &types);
   void pub_func(PointCloudXYZI &pl, const ros::Time &ct);
