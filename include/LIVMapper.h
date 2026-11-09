@@ -49,6 +49,7 @@ public:
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
+  void writeEvoPose();
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
@@ -70,6 +71,7 @@ public:
   
   string root_dir;
   string lid_topic, imu_topic, seq_name, img_topic;
+  double auto_exit_idle_sec = 0.0;        // >0: leave the main loop (and save the map) when no data arrived for this long
   V3D extT;
   M3D extR;
 
@@ -138,6 +140,8 @@ public:
   PointCloudXYZI::Ptr pcl_wait_pub;
   PointCloudXYZRGB::Ptr pcl_wait_save;
   PointCloudXYZI::Ptr pcl_wait_save_intensity;
+  PointCloudXYZI::Ptr pcl_wait_save_lidar;  // LIVO: every LiDAR point (not only the ones a camera sees), saved as all_lidar_points.pcd
+  bool lidar_map_en = false;
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
 

@@ -36,6 +36,7 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   pcl_wait_pub.reset(new PointCloudXYZI());
   pcl_wait_save.reset(new PointCloudXYZRGB());
   pcl_wait_save_intensity.reset(new PointCloudXYZI());
+  pcl_wait_save_lidar.reset(new PointCloudXYZI());
   voxelmap_manager.reset(new VoxelMapManager(voxel_config, voxel_map));
   vio_manager.reset(new VIOManager());
   root_dir = ROOT_DIR;
@@ -55,6 +56,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("common/img_en", img_en, 1);
   nh.param<int>("common/lidar_en", lidar_en, 1);
   nh.param<string>("common/img_topic", img_topic, "/left_camera/image");
+  nh.param<double>("common/auto_exit_idle_sec", auto_exit_idle_sec, 0.0);
 
   nh.param<bool>("vio/normal_en", normal_en, true);
   nh.param<bool>("vio/inverse_composition_en", inverse_composition_en, false);
@@ -102,6 +104,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("image_save/interval", img_save_interval, 1);
 
   nh.param<bool>("pcd_save/colmap_output_en", colmap_output_en, false);
+  nh.param<bool>("pcd_save/lidar_map_en", lidar_map_en, false);
   nh.param<double>("pcd_save/filter_size_pcd", filter_size_pcd, 0.5);
   nh.param<vector<double>>("extrin_calib/extrinsic_T", extrinT, vector<double>());
   nh.param<vector<double>>("extrin_calib/extrinsic_R", extrinR, vector<double>());
@@ -328,11 +331,26 @@ void LIVMapper::handleVIO()
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
   publish_img_rgb(pubImage, vio_manager);
+  if (pose_output_en) writeEvoPose();
 
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
+}
+
+void LIVMapper::writeEvoPose()
+{
+  // TUM format, final estimate of each update (after VIO in LIVO mode, after LIO otherwise)
+  static std::ofstream evoFile;
+  if (!evoFile.is_open())
+  {
+    evoFile.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + ".txt", std::ios::out);
+    if (!evoFile.is_open()) ROS_ERROR("open fail\n");
+  }
+  Eigen::Quaterniond q(_state.rot_end);
+  evoFile << std::fixed << std::setprecision(6) << LidarMeasures.last_lio_update_time << " " << _state.pos_end[0] << " " << _state.pos_end[1] << " "
+          << _state.pos_end[2] << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
 }
 
 void LIVMapper::handleLIO() 
@@ -383,28 +401,7 @@ void LIVMapper::handleLIO()
     state_update_flg = true;
   }
 
-  if (pose_output_en) 
-  {
-    static bool pos_opend = false;
-    static int ocount = 0;
-    std::ofstream outFile, evoFile;
-    if (!pos_opend) 
-    {
-      evoFile.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + ".txt", std::ios::out);
-      pos_opend = true;
-      if (!evoFile.is_open()) ROS_ERROR("open fail\n");
-    } 
-    else 
-    {
-      evoFile.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + ".txt", std::ios::app);
-      if (!evoFile.is_open()) ROS_ERROR("open fail\n");
-    }
-    Eigen::Matrix4d outT;
-    Eigen::Quaterniond q(_state.rot_end);
-    evoFile << std::fixed;
-    evoFile << LidarMeasures.last_lio_update_time << " " << _state.pos_end[0] << " " << _state.pos_end[1] << " " << _state.pos_end[2] << " "
-            << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
-  }
+  if (pose_output_en && slam_mode_ != LIVO) writeEvoPose();
   
   euler_cur = RotMtoEuler(_state.rot_end);
   geoQuat = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
@@ -493,11 +490,32 @@ void LIVMapper::savePCD()
 
     if (img_en)
     {
+      // Voxel grid with mean position and color per voxel. pcl::VoxelGrid is not used: its integer indices overflow for
+      // a building-sized map at cm leaves (it then returns the input), and its output cloud, allocated inside the PCL
+      // library, crashed on release here (Eigen alignment differs between PCL and this -march=native build).
       pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-      pcl::VoxelGrid<pcl::PointXYZRGB> voxel_filter;
-      voxel_filter.setInputCloud(pcl_wait_save);
-      voxel_filter.setLeafSize(filter_size_pcd, filter_size_pcd, filter_size_pcd);
-      voxel_filter.filter(*downsampled_cloud);
+      {
+        struct Acc { double x = 0, y = 0, z = 0, r = 0, g = 0, b = 0; int n = 0; };
+        std::unordered_map<int64_t, Acc> grid;
+        grid.reserve(pcl_wait_save->size() / 4 + 1);
+        const double inv = 1.0 / filter_size_pcd;
+        for (const auto &pt : pcl_wait_save->points)
+        {
+          const int64_t kx = static_cast<int64_t>(std::floor(pt.x * inv)) + (1 << 20), ky = static_cast<int64_t>(std::floor(pt.y * inv)) + (1 << 20),
+                        kz = static_cast<int64_t>(std::floor(pt.z * inv)) + (1 << 20);
+          Acc &a = grid[(kx << 42) | (ky << 21) | kz];
+          a.x += pt.x; a.y += pt.y; a.z += pt.z; a.r += pt.r; a.g += pt.g; a.b += pt.b; a.n++;
+        }
+        downsampled_cloud->reserve(grid.size());
+        for (const auto &kv : grid)
+        {
+          const Acc &a = kv.second;
+          pcl::PointXYZRGB q;
+          q.x = a.x / a.n; q.y = a.y / a.n; q.z = a.z / a.n;
+          q.r = static_cast<uint8_t>(a.r / a.n + 0.5); q.g = static_cast<uint8_t>(a.g / a.n + 0.5); q.b = static_cast<uint8_t>(a.b / a.n + 0.5);
+          downsampled_cloud->push_back(q);
+        }
+      }
   
       pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save); // Save the raw point cloud data
       std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir 
@@ -524,7 +542,23 @@ void LIVMapper::savePCD()
         }
       }
     }
-    else
+    if (img_en && lidar_map_en && !pcl_wait_save_lidar->empty())
+    {
+      std::string lidar_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_lidar_points.pcd";
+      // x y z intensity only (a quarter of the PointXYZINormal size), written directly
+      std::ofstream f(lidar_points_dir, std::ios::binary);
+      const size_t n = pcl_wait_save_lidar->points.size();
+      f << "# .PCD v0.7 - Point Cloud Data file format\nVERSION 0.7\nFIELDS x y z intensity\nSIZE 4 4 4 4\nTYPE F F F F\nCOUNT 1 1 1 1\n"
+        << "WIDTH " << n << "\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS " << n << "\nDATA binary\n";
+      for (const auto &pt : pcl_wait_save_lidar->points)
+      {
+        const float v[4] = {pt.x, pt.y, pt.z, pt.intensity};
+        f.write(reinterpret_cast<const char *>(v), sizeof(v));
+      }
+      std::cout << GREEN << "LiDAR point cloud (all points) saved to: " << lidar_points_dir << " with point count: " << pcl_wait_save_lidar->points.size()
+                << RESET << std::endl;
+    }
+    else if (!img_en)
     {      
       pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save_intensity);
       std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir 
@@ -536,14 +570,23 @@ void LIVMapper::savePCD()
 void LIVMapper::run() 
 {
   ros::Rate rate(5000);
+  ros::WallTime last_data_time = ros::WallTime::now();
+  bool got_data = false;
   while (ros::ok()) 
   {
     ros::spinOnce();
     if (!sync_packages(LidarMeasures)) 
     {
+      if (auto_exit_idle_sec > 0 && got_data && (ros::WallTime::now() - last_data_time).toSec() > auto_exit_idle_sec)
+      {
+        ROS_WARN("No new data for %.1f s, finishing.", auto_exit_idle_sec);
+        break;
+      }
       rate.sleep();
       continue;
     }
+    got_data = true;
+    last_data_time = ros::WallTime::now();
     handleFirstFrame();
 
     processImu();
@@ -1142,6 +1185,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   if (LidarMeasures.lio_vio_flg == VIO)
   {
     *pcl_wait_pub += *pcl_w_wait_pub;
+    if (pcd_save_en && lidar_map_en) *pcl_wait_save_lidar += *pcl_w_wait_pub;
     if(pub_num >= pub_scan_num)
     {
       pub_num = 1;
