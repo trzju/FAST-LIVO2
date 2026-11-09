@@ -12,6 +12,7 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 #include "jpeg_decode.h"
+#include <sys/stat.h>
 
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
@@ -116,6 +117,27 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("pcd_save/lidar_map_en", lidar_map_en, false);
   nh.param<bool>("publish/color_expo_norm", color_expo_norm, false);
   nh.param<double>("pcd_save/filter_size_pcd", filter_size_pcd, 0.5);
+  nh.param<bool>("loop/loop_en", loop_en, false);
+  nh.param<double>("loop/keyframe_dist", loop_cfg.keyframe_dist, 1.0);
+  nh.param<double>("loop/keyframe_angle", loop_cfg.keyframe_angle, 15.0);
+  nh.param<double>("loop/keyframe_voxel", loop_cfg.keyframe_voxel, 0.15);
+  nh.param<double>("loop/search_radius", loop_cfg.search_radius, 10.0);
+  nh.param<double>("loop/min_path_gap", loop_cfg.min_path_gap, 30.0);
+  nh.param<int>("loop/try_every", loop_cfg.try_every, 3);
+  nh.param<int>("loop/target_half", loop_cfg.target_half, 10);
+  nh.param<int>("loop/source_half", loop_cfg.source_half, 2);
+  nh.param<double>("loop/z_search_ratio", loop_cfg.z_search_ratio, 0.01);
+  nh.param<double>("loop/z_search_min", loop_cfg.z_search_min, 1.0);
+  nh.param<double>("loop/z_search_max", loop_cfg.z_search_max, 6.0);
+  nh.param<double>("loop/inlier_dist", loop_cfg.inlier_dist, 0.2);
+  nh.param<double>("loop/min_inlier_ratio", loop_cfg.min_inlier_ratio, 0.6);
+  nh.param<double>("loop/max_rmse", loop_cfg.max_rmse, 0.10);
+  nh.param<double>("loop/odom_sigma_t", loop_cfg.odom_sigma_t, 0.02);
+  nh.param<double>("loop/odom_sigma_r", loop_cfg.odom_sigma_r, 0.2);
+  nh.param<double>("loop/loop_sigma_t", loop_cfg.loop_sigma_t, 0.05);
+  nh.param<double>("loop/loop_sigma_r", loop_cfg.loop_sigma_r, 0.5);
+  nh.param<double>("loop/loop_max_residual_t", loop_cfg.loop_max_residual_t, 0.3);
+  nh.param<double>("loop/loop_max_residual_r", loop_cfg.loop_max_residual_r, 2.0);
   nh.param<vector<double>>("extrin_calib/extrinsic_T", extrinT, vector<double>());
   nh.param<vector<double>>("extrin_calib/extrinsic_R", extrinR, vector<double>());
   nh.param<vector<double>>("extrin_calib/Pcl", cameraextrinT, vector<double>());
@@ -178,6 +200,11 @@ void LIVMapper::initializeComponents()
   if (!exposure_estimate_en) p_imu->disable_exposure_est();
 
   slam_mode_ = (img_en && lidar_en) ? LIVO : imu_en ? ONLY_LIO : ONLY_LO;
+  if (loop_en)
+  {
+    loop_closure.reset(new LoopClosure(loop_cfg));
+    loop_scan.reset(new PointCloudXYZI());
+  }
 }
 
 void LIVMapper::loadCameras()
@@ -418,6 +445,7 @@ void LIVMapper::handleVIO()
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
   publish_img_rgb(pubImage, vio_manager);
   if (pose_output_en) writeEvoPose();
+  if (loop_en) recordLoopFrame();
 
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
@@ -429,14 +457,13 @@ void LIVMapper::handleVIO()
 void LIVMapper::writeEvoPose()
 {
   // TUM format, final estimate of each update (after VIO in LIVO mode, after LIO otherwise)
-  static std::ofstream evoFile;
-  if (!evoFile.is_open())
+  if (!evo_file.is_open())
   {
-    evoFile.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + ".txt", std::ios::out);
-    if (!evoFile.is_open()) ROS_ERROR("open fail\n");
+    evo_file.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + ".txt", std::ios::out);
+    if (!evo_file.is_open()) ROS_ERROR("open fail\n");
   }
   Eigen::Quaterniond q(_state.rot_end);
-  evoFile << std::fixed << std::setprecision(6) << LidarMeasures.last_lio_update_time << " " << _state.pos_end[0] << " " << _state.pos_end[1] << " "
+  evo_file << std::fixed << std::setprecision(6) << LidarMeasures.last_lio_update_time << " " << _state.pos_end[0] << " " << _state.pos_end[1] << " "
           << _state.pos_end[2] << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
 }
 
@@ -457,6 +484,11 @@ void LIVMapper::handleLIO()
 
   downSizeFilterSurf.setInputCloud(feats_undistort);
   downSizeFilterSurf.filter(*feats_down_body);
+  if (loop_en)
+  {
+    loop_scan->resize(feats_down_body->size());
+    for (size_t i = 0; i < feats_down_body->size(); i++) RGBpointBodyLidarToIMU(&feats_down_body->points[i], &loop_scan->points[i]);
+  }
   
   double t_down = omp_get_wtime();
 
@@ -531,6 +563,7 @@ void LIVMapper::handleLIO()
   if (lio_without_img && pcd_save_en && lidar_map_en) *pcl_wait_save_lidar += *laserCloudWorld;
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
+  if (loop_en && (slam_mode_ != LIVO || lio_without_img)) recordLoopFrame();
   if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
   if (voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
   publish_path(pubPath);
@@ -569,7 +602,68 @@ void LIVMapper::handleLIO()
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
 }
 
-void LIVMapper::savePCD() 
+void LIVMapper::recordLoopFrame()
+{
+  // final estimate of this update, and where its points end in the clouds that savePCD writes
+  loop_closure->addFrame(LidarMeasures.last_lio_update_time, _state.rot_end, _state.pos_end, *loop_scan);
+  loop_cloud_end.push_back({pcl_wait_save->size(), pcl_wait_save_intensity->size(), pcl_wait_save_lidar->size()});
+}
+
+void LIVMapper::applyLoopClosure()
+{
+  const std::string dir = std::string(ROOT_DIR) + "Log/loop/";
+  ::mkdir(dir.c_str(), 0775);
+  const double t0 = omp_get_wtime();
+  const int n_loops = loop_closure->optimize(dir);
+  std::cout << "[ Loop ] optimization took " << omp_get_wtime() - t0 << " s" << std::endl;
+  if (n_loops == 0) return;
+
+  // Move the points of every frame with its correction.
+  if (pcd_save_interval > 0) ROS_WARN("[ Loop ] pcd_save/interval > 0: clouds already written are not corrected");
+  auto correct = [this](auto &cloud, size_t CloudEnd::*end) {
+    size_t begin = 0;
+    for (size_t f = 0; f < loop_cloud_end.size(); f++)
+    {
+      const size_t stop = std::min(loop_cloud_end[f].*end, cloud.size());
+      const Sophus::SE3 &c = loop_closure->correction(f);
+      const Eigen::Matrix3f R = c.rotation_matrix().cast<float>();
+      const Eigen::Vector3f t = c.translation().cast<float>();
+#pragma omp parallel for
+      for (long k = static_cast<long>(begin); k < static_cast<long>(stop); k++)
+      {
+        auto &p = cloud.points[k];
+        const Eigen::Vector3f q = R * Eigen::Vector3f(p.x, p.y, p.z) + t;
+        p.x = q[0];
+        p.y = q[1];
+        p.z = q[2];
+      }
+      begin = std::max(begin, stop);
+    }
+  };
+  correct(*pcl_wait_save, &CloudEnd::rgb);
+  correct(*pcl_wait_save_intensity, &CloudEnd::intensity);
+  correct(*pcl_wait_save_lidar, &CloudEnd::lidar);
+
+  // The trajectory file becomes the corrected one; the odometry is kept in Log/loop/.
+  if (pose_output_en)
+  {
+    evo_file.close();
+    const std::string traj = std::string(ROOT_DIR) + "Log/result/" + seq_name + ".txt";
+    std::rename(traj.c_str(), (dir + "odom_trajectory.txt").c_str());
+    std::ofstream f(traj);
+    f << std::fixed << std::setprecision(6);
+    for (size_t i = 0; i < loop_closure->numFrames(); i++)
+    {
+      const Sophus::SE3 T = loop_closure->correctedPose(i);
+      const Eigen::Quaterniond q(T.rotation_matrix());
+      f << loop_closure->frameTime(i) << " " << T.translation()[0] << " " << T.translation()[1] << " " << T.translation()[2] << " " << q.x() << " "
+        << q.y() << " " << q.z() << " " << q.w() << "\n";
+    }
+  }
+  std::cout << "[ Loop ] trajectory and clouds corrected with " << n_loops << " loop closures" << std::endl;
+}
+
+void LIVMapper::savePCD()
 {
   if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0) 
   {
@@ -693,6 +787,7 @@ void LIVMapper::run()
       for (VisualPoint *pt : kv.second->voxel_points)
         if (pt != nullptr)
           for (Feature *ftr : pt->obs_) ftr->img_.release();
+  if (loop_en) applyLoopClosure();
   savePCD();
 }
 

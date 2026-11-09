@@ -16,6 +16,7 @@ which is included as part of this source code package.
 #include "IMU_Processing.h"
 #include "vio.h"
 #include "preprocess.h"
+#include "loop_closure.h"
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
@@ -58,6 +59,8 @@ public:
   void pushCameraImage(double stamp, int cam_idx, const cv::Mat &img);
   void loadCameras();
   void writeEvoPose();
+  void recordLoopFrame();
+  void applyLoopClosure();
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
@@ -175,6 +178,18 @@ public:
   PointCloudXYZI::Ptr pcl_wait_save_lidar;  // LIVO: every LiDAR point (not only the ones a camera sees), saved as all_lidar_points.pcd
   bool lidar_map_en = false;
   bool color_expo_norm = false;             // multiply map colors by the camera's estimated inverse exposure time
+
+  // Loop closure (loop/...): a keyframe pose graph optimized at the end corrects the saved trajectory and clouds.
+  bool loop_en = false;
+  LoopClosureConfig loop_cfg;
+  std::unique_ptr<LoopClosure> loop_closure;
+  PointCloudXYZI::Ptr loop_scan;            // LiDAR points of the current update in the IMU frame
+  struct CloudEnd
+  {
+    size_t rgb, intensity, lidar;
+  };
+  vector<CloudEnd> loop_cloud_end;          // per recorded frame: sizes of the saved clouds once its points are in
+  std::ofstream evo_file;                   // TUM trajectory (evo/pose_output_en)
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
 

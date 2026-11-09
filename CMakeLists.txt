@@ -127,7 +127,7 @@ add_library(vio src/vio.cpp src/frame.cpp src/visual_point.cpp)
 add_library(lio src/voxel_map.cpp)
 add_library(pre src/preprocess.cpp)
 add_library(imu_proc src/IMU_Processing.cpp)
-add_library(laser_mapping src/LIVMapper.cpp)
+add_library(laser_mapping src/LIVMapper.cpp src/loop_closure.cpp)
 
 target_link_libraries(laser_mapping ${JPEG_LIBRARIES})
 
