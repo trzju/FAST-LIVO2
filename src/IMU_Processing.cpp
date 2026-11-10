@@ -117,6 +117,9 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
     const auto &gyr_acc = meas.imu.front()->angular_velocity;
     mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+    init_t0_ = init_t_last_ = meas.imu.front()->header.stamp.toSec();
+    init_R_ = Eye3d;
+    init_f_sum_ = Zero3d;
     // first_lidar_time = meas.lidar_frame_beg_time;
     // cout<<"init acc norm: "<<mean_acc.norm()<<endl;
   }
@@ -127,6 +130,16 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
     const auto &gyr_acc = imu->angular_velocity;
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+
+    if (init_time_ > 0)
+    {
+      // rotate every sample into the frame of the first one, so turning and swaying while walking do not tilt the mean
+      const double t = imu->header.stamp.toSec();
+      if (N > 1 && t <= init_t_last_) continue; // a sample seen in the previous measurement group
+      if (t > init_t_last_) init_R_ = init_R_ * Exp(cur_gyr, t - init_t_last_);
+      init_t_last_ = t;
+      init_f_sum_ += init_R_ * cur_acc;
+    }
 
     mean_acc += (cur_acc - mean_acc) / N;
     mean_gyr += (cur_gyr - mean_gyr) / N;
@@ -141,7 +154,15 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
     N++;
   }
   IMU_mean_acc_norm = mean_acc.norm();
-  state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
+  acc_unit = acc_norm_ > 0 ? acc_norm_ : IMU_mean_acc_norm;
+  if (init_time_ > 0)
+  {
+    // mean specific force in the frame of the last sample, which becomes the world frame (rot_end = I)
+    const V3D f = init_R_.transpose() * init_f_sum_;
+    state_inout.gravity = -f / f.norm() * G_m_s2;
+  }
+  else
+    state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
   state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
   state_inout.bias_g = Zero3d; // mean_gyr;
 
@@ -350,7 +371,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       // imu_time = head->header.stamp.toSec() - first_lidar_time;
 
       angvel_avr -= state_inout.bias_g;
-      acc_avr = acc_avr * G_m_s2 / mean_acc.norm() - state_inout.bias_a;
+      acc_avr = acc_avr * G_m_s2 / acc_unit - state_inout.bias_a;
 
       if (head->header.stamp.toSec() < prop_beg_time)
       {
@@ -565,15 +586,25 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
     if (meas.imu.empty()) { return; };
     /// The very first lidar frame
     IMU_init(meas, stat, init_iter_num);
+    // A long initialization (init_time) must let the data cut move on: otherwise every cut starts at the first LiDAR
+    // frame, and once that is max_img_gap old the camera-dropout path cuts an empty interval forever.
+    if (init_time_ > 0 && lidar_meas.lio_vio_flg == LIO) lidar_meas.last_lio_update_time = pcl_end_time;
 
     imu_need_init = true;
 
     last_imu = meas.imu.back();
 
-    if (init_iter_num > MAX_INI_COUNT)
+    if (init_iter_num > MAX_INI_COUNT && init_t_last_ - init_t0_ >= init_time_)
     {
       // cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init = false;
+      if (init_bg_std_ > 0) stat.cov.block<3, 3>(10, 10) = M3D::Identity() * init_bg_std_ * init_bg_std_;
+      if (init_ba_std_ > 0) stat.cov.block<3, 3>(13, 13) = M3D::Identity() * init_ba_std_ * init_ba_std_;
+      if (init_bg_std_ > 0 || init_ba_std_ > 0)
+        ROS_INFO("IMU init: initial bias std %.2f deg/s (gyro), %.3f m/s^2 (acc)", sqrt(stat.cov(10, 10)) * 180.0 / M_PI, sqrt(stat.cov(13, 13)));
+      ROS_INFO("IMU init: %.2f s, %d samples, rotated %.1f deg, mean |acc| %.4f, scaled as gravity = %.4f (%s)",
+               init_t_last_ - init_t0_, init_iter_num - 1, Eigen::AngleAxisd(init_R_).angle() * 180.0 / M_PI, IMU_mean_acc_norm,
+               acc_unit, acc_norm_ > 0 ? "imu/acc_norm" : "measured mean");
       ROS_INFO("IMU Initials: Gravity: %.4f %.4f %.4f %.4f; acc covarience: "
                "%.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f \n",
                stat.gravity[0], stat.gravity[1], stat.gravity[2], mean_acc.norm(), cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1],

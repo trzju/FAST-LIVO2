@@ -93,6 +93,10 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<double>("imu/gyr_cov", gyr_cov, 1.0);
   nh.param<double>("imu/acc_cov", acc_cov, 1.0);
   nh.param<int>("imu/imu_int_frame", imu_int_frame, 3);
+  nh.param<double>("imu/acc_norm", imu_acc_norm, 0.0);
+  nh.param<double>("imu/init_time", imu_init_time, 0.0);
+  nh.param<double>("imu/init_bg_std", imu_init_bg_std, 0.0);
+  nh.param<double>("imu/init_ba_std", imu_init_ba_std, 0.0);
   nh.param<bool>("imu/imu_en", imu_en, false);
   nh.param<bool>("imu/gravity_est_en", gravity_est_en, true);
   nh.param<bool>("imu/ba_bg_est_en", ba_bg_est_en, true);
@@ -192,6 +196,9 @@ void LIVMapper::initializeComponents()
   p_imu->set_gyr_bias_cov(V3D(0.0001, 0.0001, 0.0001));
   p_imu->set_acc_bias_cov(V3D(0.0001, 0.0001, 0.0001));
   p_imu->set_imu_init_frame_num(imu_int_frame);
+  p_imu->set_acc_norm(imu_acc_norm);
+  p_imu->set_init_time(imu_init_time);
+  p_imu->set_init_bias_std(imu_init_bg_std, imu_init_ba_std);
   p_imu->extra_expo_num = (exposure_estimate_en && exposure_per_camera) ? num_cams - 1 : 0;
 
   if (!imu_en) p_imu->disable_imu();
@@ -793,8 +800,7 @@ void LIVMapper::run()
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)
 {
-  double mean_acc_norm = p_imu->IMU_mean_acc_norm;
-  acc_avr = acc_avr * G_m_s2 / mean_acc_norm - imu_prop_state.bias_a;
+  acc_avr = acc_avr * G_m_s2 / p_imu->acc_unit - imu_prop_state.bias_a;
   angvel_avr -= imu_prop_state.bias_g;
 
   M3D Exp_f = Exp(angvel_avr, dt);

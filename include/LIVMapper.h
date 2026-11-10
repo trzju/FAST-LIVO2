@@ -140,6 +140,8 @@ public:
   bool lidar_pushed = false, imu_en, gravity_est_en, flg_reset = false, ba_bg_est_en = true;
   bool dense_map_en = false;
   int img_en = 1, imu_int_frame = 3;
+  double imu_acc_norm = 0.0, imu_init_time = 0.0; // imu/acc_norm, imu/init_time (see ImuProcess)
+  double imu_init_bg_std = 0.0, imu_init_ba_std = 0.0; // imu/init_bg_std [deg/s], imu/init_ba_std [m/s^2]
   bool normal_en = true;
   bool exposure_estimate_en = false;
   bool exposure_per_camera = true;
