@@ -133,6 +133,11 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<double>("loop/z_search_ratio", loop_cfg.z_search_ratio, 0.01);
   nh.param<double>("loop/z_search_min", loop_cfg.z_search_min, 1.0);
   nh.param<double>("loop/z_search_max", loop_cfg.z_search_max, 6.0);
+  nh.param<double>("loop/yaw_search", loop_cfg.yaw_search, 0.0);
+  nh.param<double>("loop/yaw_step", loop_cfg.yaw_step, 1.0);
+  nh.param<double>("loop/xy_search", loop_cfg.xy_search, 0.0);
+  nh.param<double>("loop/xy_step", loop_cfg.xy_step, 0.5);
+  nh.param<bool>("loop/dump_keyframes", loop_cfg.dump_keyframes, false);
   nh.param<double>("loop/inlier_dist", loop_cfg.inlier_dist, 0.2);
   nh.param<double>("loop/min_inlier_ratio", loop_cfg.min_inlier_ratio, 0.6);
   nh.param<double>("loop/max_rmse", loop_cfg.max_rmse, 0.10);

@@ -136,30 +136,51 @@ LoopClosure::Cloud::Ptr LoopClosure::submap(int center, int half) const
 
 LoopClosure::LoopResult LoopClosure::registerLoop(int i, int j) const
 {
-  LoopResult r{i, j, 0.0, 0.0, 0.0, 0.0, false, false, 0.0, 0.0, Sophus::SE3()};
+  LoopResult r{i, j, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false, false, 0.0, 0.0, Sophus::SE3()};
   const Cloud::Ptr target = submap(j, cfg_.target_half), source = submap(i, cfg_.source_half);
   if (target->size() < 100 || source->size() < 100) return r;
   pcl::KdTreeFLANN<pcl::PointXYZ> tree;
   tree.setInputCloud(target);
   const Sophus::SE3 &Ti = keyframes_[i].pose, &Tj = keyframes_[j].pose;
 
-  // Coarse: the odometry drifts mostly in height, so search the world z offset of keyframe i first.
+  // Coarse: the odometry drifts mostly in height, so search the world z offset of keyframe i first; optionally also its
+  // heading (rotation about keyframe i) and then its horizontal position, for a long first pass that drifted in yaw.
   Cloud sub;
   const size_t step = std::max<size_t>(1, source->size() / 1500);
   for (size_t k = 0; k < source->size(); k += step) sub.push_back(source->points[k]);
   const double z_range = std::min(cfg_.z_search_max, std::max(cfg_.z_search_min, cfg_.z_search_ratio * (keyframes_[i].path - keyframes_[j].path)));
   const int nz = static_cast<int>(std::ceil(z_range / 0.2));
-  double best_ratio = -1.0, rmse;
-  for (int k = -nz; k <= nz; k++)
-  {
-    const double dz = 0.2 * k;
+  const int nyaw = cfg_.yaw_search > 0 ? static_cast<int>(std::round(cfg_.yaw_search / cfg_.yaw_step)) : 0;
+  const V3D pi = Ti.translation();
+  auto correction = [&pi](double yaw_deg, double dx, double dy, double dz) {
+    const M3D R = Eigen::AngleAxisd(yaw_deg * M_PI / 180.0, V3D::UnitZ()).toRotationMatrix();
+    return Sophus::SE3(R, pi - R * pi + V3D(dx, dy, dz)); // world-frame correction of keyframe i
+  };
+  double best_ratio = -1.0, best_size = 0.0, rmse;
+  auto consider = [&](double yaw, double dx, double dy, double dz) {
     double ratio;
-    inlierStats(sub, Tj.inverse() * Sophus::SE3(M3D::Identity(), V3D(0, 0, dz)) * Ti, tree, 0.3, ratio, rmse);
-    if (ratio > best_ratio + 1e-9 || (ratio > best_ratio - 1e-9 && std::fabs(dz) < std::fabs(r.dz)))
+    inlierStats(sub, Tj.inverse() * correction(yaw, dx, dy, dz) * Ti, tree, 0.3, ratio, rmse);
+    const double size = std::fabs(yaw) * 0.2 + std::hypot(dx, dy) + std::fabs(dz); // ties: the smaller correction
+    if (ratio > best_ratio + 1e-9 || (ratio > best_ratio - 1e-9 && size < best_size))
     {
       best_ratio = ratio;
+      best_size = size;
+      r.yaw = yaw;
+      r.dx = dx;
+      r.dy = dy;
       r.dz = dz;
     }
+  };
+  for (int a = -nyaw; a <= nyaw; a++)
+    for (int k = -nz; k <= nz; k++) consider(a * cfg_.yaw_step, 0.0, 0.0, 0.2 * k);
+  if (cfg_.xy_search > 0)
+  {
+    const int nxy = static_cast<int>(std::round(cfg_.xy_search / cfg_.xy_step));
+    const double yaw0 = r.yaw, dz0 = r.dz;
+    for (int a = -nxy; a <= nxy; a++)
+      for (int b = -nxy; b <= nxy; b++) consider(yaw0, a * cfg_.xy_step, b * cfg_.xy_step, dz0);
+    const double dx0 = r.dx, dy0 = r.dy;
+    for (int a = -nyaw; a <= nyaw; a++) consider(a * cfg_.yaw_step, dx0, dy0, dz0); // heading again at the new position
   }
   r.coarse_ratio = best_ratio;
   if (best_ratio < 0.1) return r;
@@ -172,7 +193,7 @@ LoopClosure::LoopResult LoopClosure::registerLoop(int i, int j) const
   gicp.setTransformationEpsilon(1e-6);
   Cloud aligned;
   gicp.setMaxCorrespondenceDistance(1.0);
-  gicp.align(aligned, toMatrix(Tj.inverse() * Sophus::SE3(M3D::Identity(), V3D(0, 0, r.dz)) * Ti));
+  gicp.align(aligned, toMatrix(Tj.inverse() * correction(r.yaw, r.dx, r.dy, r.dz) * Ti));
   if (!gicp.hasConverged()) return r;
   gicp.setMaxCorrespondenceDistance(0.3);
   gicp.align(aligned, gicp.getFinalTransformation());
@@ -287,6 +308,7 @@ void LoopClosure::optimizeGraph(const std::vector<Edge> &edges, std::vector<Soph
 int LoopClosure::optimize(const std::string &log_dir)
 {
   const int K = keyframes_.size();
+  if (cfg_.dump_keyframes) saveKeyframes(log_dir + "keyframes.bin");
   if (K < 2) return 0;
 
   // One candidate per tried keyframe: the horizontally closest earlier keyframe far enough back along the path.
@@ -384,13 +406,66 @@ int LoopClosure::optimize(const std::string &log_dir)
   }
   std::ofstream fl(log_dir + "loops.txt");
   fl << "# keyframe_i keyframe_j time_i time_j path_gap_m z_offset_m coarse_inlier_ratio inlier_ratio rmse_m accepted used "
-        "residual_m residual_deg\n" << std::fixed
+        "residual_m residual_deg coarse_yaw_deg coarse_dx_m coarse_dy_m\n" << std::fixed
      << std::setprecision(4);
   for (const LoopResult &r : results)
     fl << r.i << " " << r.j << " " << keyframes_[r.i].time << " " << keyframes_[r.j].time << " " << keyframes_[r.i].path - keyframes_[r.j].path << " "
        << r.dz << " " << r.coarse_ratio << " " << r.ratio << " " << r.rmse << " " << int(r.accepted) << " " << int(r.used) << " " << r.residual_t << " "
-       << r.residual_r << "\n";
+       << r.residual_r << " " << r.yaw << " " << r.dx << " " << r.dy << "\n";
   std::cout << "[ Loop ] " << K << " keyframes, " << candidates.size() << " loop candidates, " << n_loops << " accepted, largest keyframe shift "
             << max_shift << " m" << std::endl;
   return n_loops;
+}
+
+void LoopClosure::saveKeyframes(const std::string &path) const
+{
+  std::ofstream f(path, std::ios::binary);
+  const uint32_t magic = 0x3146464b, n = keyframes_.size(); // "KFF1"
+  f.write(reinterpret_cast<const char *>(&magic), 4);
+  f.write(reinterpret_cast<const char *>(&n), 4);
+  for (const Keyframe &kf : keyframes_)
+  {
+    const Eigen::Quaterniond q(kf.pose.rotation_matrix());
+    const V3D &t = kf.pose.translation();
+    const double head[9] = {kf.time, kf.path, t.x(), t.y(), t.z(), q.x(), q.y(), q.z(), q.w()};
+    const uint32_t m = kf.cloud->size();
+    f.write(reinterpret_cast<const char *>(head), sizeof(head));
+    f.write(reinterpret_cast<const char *>(&m), 4);
+    for (const auto &p : kf.cloud->points) f.write(reinterpret_cast<const char *>(p.data), 12);
+  }
+  std::cout << "[ Loop ] " << n << " keyframes saved to " << path << std::endl;
+}
+
+bool LoopClosure::loadKeyframes(const std::string &path)
+{
+  std::ifstream f(path, std::ios::binary);
+  uint32_t magic = 0, n = 0;
+  f.read(reinterpret_cast<char *>(&magic), 4);
+  f.read(reinterpret_cast<char *>(&n), 4);
+  if (!f || magic != 0x3146464b) return false;
+  frames_.clear();
+  corrections_.clear();
+  keyframes_.clear();
+  pending_.clear();
+  for (uint32_t k = 0; k < n; k++)
+  {
+    double head[9];
+    uint32_t m = 0;
+    f.read(reinterpret_cast<char *>(head), sizeof(head));
+    f.read(reinterpret_cast<char *>(&m), 4);
+    Keyframe kf;
+    kf.frame = frames_.size();
+    kf.time = head[0];
+    kf.path = head[1];
+    kf.pose = Sophus::SE3(Eigen::Quaterniond(head[8], head[5], head[6], head[7]).normalized(), V3D(head[2], head[3], head[4]));
+    kf.cloud.reset(new Cloud);
+    kf.cloud->resize(m);
+    for (uint32_t i = 0; i < m; i++) f.read(reinterpret_cast<char *>(kf.cloud->points[i].data), 12);
+    if (!f) return false;
+    frames_.push_back({kf.time, kf.pose});
+    corrections_.push_back(Sophus::SE3());
+    keyframes_.push_back(kf);
+    path_ = kf.path;
+  }
+  return true;
 }

@@ -153,3 +153,7 @@ target_link_libraries(fastlivo_mapping
 if(mimalloc_FOUND)
   target_link_libraries(fastlivo_mapping mimalloc)
 endif()
+
+# Loop closure on saved keyframes (loop/dump_keyframes), for tuning it without replaying a recording
+add_executable(loop_offline src/loop_offline.cpp src/loop_closure.cpp)
+target_link_libraries(loop_offline ${PCL_LIBRARIES} ${Sophus_LIBRARIES} ${OpenMP_CXX_LIBRARIES})

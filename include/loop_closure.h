@@ -27,6 +27,9 @@ struct LoopClosureConfig
   int source_half = 2;                          // keyframes on each side of the later keyframe in its cloud
   double z_search_ratio = 0.01;                 // vertical search range: this share of the path between the keyframes,
   double z_search_min = 1.0, z_search_max = 6.0; //   clamped to [min, max] m
+  double yaw_search = 0.0, yaw_step = 1.0;      // deg: coarse search of the heading of keyframe i (each side), 0 = off
+  double xy_search = 0.0, xy_step = 0.5;        // m: coarse horizontal search after the heading one, 0 = off
+  bool dump_keyframes = false;                  // write keyframes.bin (keyframe poses and clouds) for loop_offline
   double inlier_dist = 0.2;                     // m, a source point closer than this to the target is an inlier
   double min_inlier_ratio = 0.6;                // accept a loop with at least this share of inliers
   double max_rmse = 0.10;                       // m, and at most this inlier RMSE
@@ -45,6 +48,9 @@ public:
   /// Detect loops among the keyframes and optimize the keyframe pose graph. Writes keyframes.txt and loops.txt to
   /// log_dir. Returns the number of loop closures used (0: corrections stay identity).
   int optimize(const std::string &log_dir);
+  /// Keyframes (time, path, odometry pose, cloud) in a binary file, to re-run the loop closure offline (loop_offline).
+  void saveKeyframes(const std::string &path) const;
+  bool loadKeyframes(const std::string &path);
 
   size_t numFrames() const { return frames_.size(); }
   double frameTime(size_t i) const { return frames_[i].time; }
@@ -77,6 +83,7 @@ private:
   {
     int i, j;
     double dz, coarse_ratio, ratio, rmse;
+    double yaw, dx, dy; // deg, m: heading and horizontal part of the coarse correction (dz: vertical part)
     bool accepted;
     bool used;                  // kept in the final pose graph
     double residual_t, residual_r; // m, deg: disagreement with the optimized graph
