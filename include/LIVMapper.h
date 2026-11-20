@@ -95,6 +95,7 @@ public:
   bool img_compressed = false;            // sensor_msgs/CompressedImage (JPEG) instead of sensor_msgs/Image
   int img_decode_reduce = 1;              // 1, 2, 4 or 8: decode / downsample images by this factor on arrival
   double img_sync_tolerance = 0.002;      // s, images closer than this belong to the same frame
+  vector<double> cam_stamp_shift;         // s per camera (cam<i>/stamp_shift), added to its stamps before grouping
   double img_incomplete_timeout = 0.3;    // s, a frame still missing a camera after this is used with the others
   double max_img_gap = 0.5;               // s, LIVO: without an image for this long, LIO runs per LiDAR period without VIO
   bool lio_without_img = false;           // the current LIO update has no image (camera dropout), no VIO follows

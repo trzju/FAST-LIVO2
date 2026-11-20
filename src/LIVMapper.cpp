@@ -231,9 +231,10 @@ void LIVMapper::loadCameras()
   }
 
   // Camera rig: camera i in the node namespace cam<i> (model as vikit expects it plus Rcl, Pcl, time_offset,
-  // max_incidence_deg, mask_file, vignetting), image topic common/img_topics[i].
+  // stamp_shift, max_incidence_deg, mask_file, vignetting), image topic common/img_topics[i].
   num_cams = img_topics.size();
   if (num_cams > MAX_CAMS) throw std::runtime_error("More cameras than MAX_CAMS");
+  cam_stamp_shift.assign(num_cams, 0.0);
   for (int i = 0; i < num_cams; i++)
   {
     const std::string ns = "laserMapping/cam" + std::to_string(i);
@@ -252,6 +253,16 @@ void LIVMapper::loadCameras()
     ros::param::param<vector<double>>(ns + "/time_offset_steps", time_offset_steps, vector<double>());
     if (time_offset_steps.size() % 2) throw std::runtime_error(ns + "/time_offset_steps needs pairs [t, offset, ...]");
     if (R_cl.size() != 9 || P_cl.size() != 3) throw std::runtime_error(ns + "/Rcl (9 values) and " + ns + "/Pcl (3 values) are required");
+    // stamp_shift: added to this camera's image stamps so that images of one frame carry the same time (cameras that
+    // are not triggered together). time_offset(_steps) stay relative to the camera's own stamp + img_time_offset; the
+    // VIO offset is taken from the shifted frame time, hence minus the shift.
+    double stamp_shift;
+    ros::param::param<double>(ns + "/stamp_shift", stamp_shift, 0.0);
+    cam_stamp_shift[i] = stamp_shift;
+    time_offset -= stamp_shift;
+    for (size_t k = 1; k < time_offset_steps.size(); k += 2) time_offset_steps[k] -= stamp_shift;
+    if (stamp_shift != 0.0)
+      ROS_INFO("Camera %d: stamps shifted by %+.4f s for the frame grouping, capture at frame time %+.4f s", i, stamp_shift, time_offset);
     cv::Mat mask;
     if (!mask_file.empty())
     {
@@ -1136,7 +1147,7 @@ void LIVMapper::img_multi_cbk(const sensor_msgs::ImageConstPtr &msg_in, int cam_
   cv::Mat img = getImageFromMsg(msg_in);
   if (img_decode_reduce > 1) cv::resize(img, img, cv::Size(img.cols / img_decode_reduce, img.rows / img_decode_reduce), 0, 0, cv::INTER_AREA);
   mtx_buffer.lock();
-  pushCameraImage(msg_in->header.stamp.toSec() + img_time_offset, cam_idx, img);
+  pushCameraImage(msg_in->header.stamp.toSec() + img_time_offset + cam_stamp_shift[cam_idx], cam_idx, img);
   mtx_buffer.unlock();
   sig_buffer.notify_all();
 }
@@ -1169,7 +1180,7 @@ void LIVMapper::img_compressed_cbk(const sensor_msgs::CompressedImageConstPtr &m
     cv::resize(img, img, cv::Size(camera->width(), camera->height()), 0, 0, cv::INTER_AREA);
   }
   mtx_buffer.lock();
-  pushCameraImage(msg_in->header.stamp.toSec() + img_time_offset, cam_idx, img);
+  pushCameraImage(msg_in->header.stamp.toSec() + img_time_offset + cam_stamp_shift[cam_idx], cam_idx, img);
   mtx_buffer.unlock();
   sig_buffer.notify_all();
 }
