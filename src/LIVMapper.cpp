@@ -12,7 +12,9 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 #include "jpeg_decode.h"
+#include <sensor_msgs/point_cloud2_iterator.h>
 #include <sys/stat.h>
+#include <unordered_set>
 
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
@@ -122,6 +124,11 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("publish/color_expo_norm", color_expo_norm, false);
   nh.param<double>("pcd_save/filter_size_pcd", filter_size_pcd, 0.5);
   nh.param<bool>("loop/loop_en", loop_en, false);
+  nh.param<bool>("dyn_removal/enable", dyn_en, false);
+  nh.param<double>("dyn_removal/wait_sec", dyn_wait_sec, 30.0);
+  nh.param<int>("dyn_removal/max_points", dyn_max_points, 0);
+  // default: the detector's per-frame buffer (M-detector dyn_obj/points_num_perframe), which overflows beyond it
+  if (dyn_max_points <= 0) nh.param<int>("dyn_obj/points_num_perframe", dyn_max_points, 30000);
   nh.param<double>("loop/keyframe_dist", loop_cfg.keyframe_dist, 1.0);
   nh.param<double>("loop/keyframe_angle", loop_cfg.keyframe_angle, 15.0);
   nh.param<double>("loop/keyframe_voxel", loop_cfg.keyframe_voxel, 0.15);
@@ -349,6 +356,19 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
   imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
   voxelmap_manager->voxel_map_pub_= nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
+  if (dyn_en)
+  {
+    std::string body_topic, odom_topic, dyn_topic;
+    nh.param<std::string>("dyn_removal/body_topic", body_topic, "/cloud_registered_body");
+    nh.param<std::string>("dyn_removal/odom_topic", odom_topic, "/Odometry");
+    nh.param<std::string>("dyn_removal/dyn_topic", dyn_topic, "/m_detector/frame_out");
+    pubDynBody = nh.advertise<sensor_msgs::PointCloud2>(body_topic, 1000);
+    pubDynOdom = nh.advertise<nav_msgs::Odometry>(odom_topic, 1000);
+    subDyn = nh.subscribe(dyn_topic, 100000, &LIVMapper::dyn_cbk, this);
+    dyn_cloud.reset(new PointCloudXYZI());
+    ROS_INFO("Dynamic point removal: updates on %s + %s (at most %d points), dynamic points from %s", body_topic.c_str(), odom_topic.c_str(),
+             dyn_max_points, dyn_topic.c_str());
+  }
 }
 
 void LIVMapper::handleFirstFrame() 
@@ -468,7 +488,7 @@ void LIVMapper::handleVIO()
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
   publish_img_rgb(pubImage, vio_manager);
   if (pose_output_en) writeEvoPose();
-  if (loop_en) recordLoopFrame();
+  if (loop_en || dyn_en) recordFrame();
 
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
@@ -548,6 +568,7 @@ void LIVMapper::handleLIO()
   euler_cur = RotMtoEuler(_state.rot_end);
   geoQuat = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
   publish_odometry(pubOdomAftMapped);
+  if (dyn_en) publishForDetector();
 
   double t3 = omp_get_wtime();
 
@@ -586,7 +607,7 @@ void LIVMapper::handleLIO()
   if (lio_without_img && pcd_save_en && lidar_map_en) *pcl_wait_save_lidar += *laserCloudWorld;
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
-  if (loop_en && (slam_mode_ != LIVO || lio_without_img)) recordLoopFrame();
+  if ((loop_en || dyn_en) && (slam_mode_ != LIVO || lio_without_img)) recordFrame();
   if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
   if (voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
   publish_path(pubPath);
@@ -625,11 +646,164 @@ void LIVMapper::handleLIO()
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
 }
 
-void LIVMapper::recordLoopFrame()
+void LIVMapper::recordFrame()
 {
   // final estimate of this update, and where its points end in the clouds that savePCD writes
-  loop_closure->addFrame(LidarMeasures.last_lio_update_time, _state.rot_end, _state.pos_end, *loop_scan);
-  loop_cloud_end.push_back({pcl_wait_save->size(), pcl_wait_save_intensity->size(), pcl_wait_save_lidar->size()});
+  if (loop_en) loop_closure->addFrame(LidarMeasures.last_lio_update_time, _state.rot_end, _state.pos_end, *loop_scan);
+  loop_cloud_end.push_back({pcl_wait_save->size(), pcl_wait_save_intensity->size(), pcl_wait_save_lidar->size(), 0});
+  if (dyn_en)
+  {
+    FramePose fp = dyn_cur_pose;
+    if (std::fabs(fp.time - LidarMeasures.last_lio_update_time) > 1e-6) fp.time = -1.0; // no LIO pose published for it
+    frame_pose.push_back(fp);
+  }
+}
+
+void LIVMapper::publishForDetector()
+{
+  // The undistorted points of this LIO update (LiDAR frame, at the update time) in the IMU frame, and the LIO pose they
+  // are placed in the map with, both stamped with the update time (the detector pairs them by stamp).
+  const double t = LidarMeasures.last_lio_update_time;
+  dyn_cur_pose = {t, _state.rot_end, _state.pos_end};
+  const ros::Time stamp = ros::Time().fromSec(t);
+
+  const size_t n = feats_undistort->size();
+  const size_t step = (dyn_max_points > 0 && n > static_cast<size_t>(dyn_max_points)) ? (n + dyn_max_points - 1) / dyn_max_points : 1;
+  PointCloudXYZI body;
+  body.reserve(n / step + 1);
+  for (size_t i = 0; i < n; i += step)
+  {
+    PointType p;
+    RGBpointBodyLidarToIMU(&feats_undistort->points[i], &p);
+    body.push_back(p);
+  }
+  sensor_msgs::PointCloud2 cloud_msg;
+  pcl::toROSMsg(body, cloud_msg);
+  cloud_msg.header.stamp = stamp;
+  cloud_msg.header.frame_id = "body";
+  pubDynBody.publish(cloud_msg);
+
+  nav_msgs::Odometry odom;
+  odom.header.stamp = stamp;
+  odom.header.frame_id = "camera_init";
+  odom.child_frame_id = "body";
+  const Eigen::Quaterniond q(_state.rot_end);
+  odom.pose.pose.orientation.x = q.x();
+  odom.pose.pose.orientation.y = q.y();
+  odom.pose.pose.orientation.z = q.z();
+  odom.pose.pose.orientation.w = q.w();
+  odom.pose.pose.position.x = _state.pos_end[0];
+  odom.pose.pose.position.y = _state.pos_end[1];
+  odom.pose.pose.position.z = _state.pos_end[2];
+  pubDynOdom.publish(odom);
+}
+
+void LIVMapper::dyn_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
+{
+  const double t = msg->header.stamp.toSec();
+  std::vector<Eigen::Vector3f> &pts = dyn_frames[t];
+  pts.clear();
+  const size_t n = static_cast<size_t>(msg->width) * msg->height;
+  if (n > 0)
+  {
+    pts.reserve(n);
+    sensor_msgs::PointCloud2ConstIterator<float> ix(*msg, "x"), iy(*msg, "y"), iz(*msg, "z");
+    for (size_t i = 0; i < n; ++i, ++ix, ++iy, ++iz) pts.emplace_back(*ix, *iy, *iz);
+  }
+  dyn_last_stamp = std::max(dyn_last_stamp, t);
+  dyn_last_recv = ros::WallTime::now();
+}
+
+void LIVMapper::removeDynamicPoints()
+{
+  if (frame_pose.empty()) return;
+  double t_need = -1.0;
+  for (const auto &fp : frame_pose) t_need = std::max(t_need, fp.time);
+
+  // the detector runs behind: wait until it has sent the last update (or has been silent for dyn_wait_sec)
+  const ros::WallTime t_wait = ros::WallTime::now();
+  while (ros::ok() && dyn_last_stamp < t_need - 1e-4)
+  {
+    ros::spinOnce();
+    const ros::WallTime ref = dyn_last_recv > t_wait ? dyn_last_recv : t_wait;
+    if ((ros::WallTime::now() - ref).toSec() > dyn_wait_sec)
+    {
+      ROS_WARN("[ Dyn ] no detector output for %.0f s, last one at %.3f, last update at %.3f", dyn_wait_sec, dyn_last_stamp, t_need);
+      break;
+    }
+    ros::WallDuration(0.05).sleep();
+  }
+  std::cout << "[ Dyn ] waited " << (ros::WallTime::now() - t_wait).toSec() << " s for the detector" << std::endl;
+
+  // Every saved point is a voxel centroid of its update's downsampling grid (filter_size_surf, LiDAR frame): drop it
+  // when that voxel holds a dynamic point of the same update. The points are compacted in place, frame by frame, so the
+  // per-frame ends (and with them the loop correction) stay valid.
+  const double inv = 1.0 / filter_size_surf_min;
+  auto key = [inv](const V3D &p) {
+    const int64_t kx = static_cast<int64_t>(std::floor(p[0] * inv)) + (1 << 20), ky = static_cast<int64_t>(std::floor(p[1] * inv)) + (1 << 20),
+                  kz = static_cast<int64_t>(std::floor(p[2] * inv)) + (1 << 20);
+    return (kx << 42) | (ky << 21) | kz;
+  };
+  std::unordered_set<int64_t> keys;
+  M3D R_lt;
+  V3D t_l;
+  auto filter = [&](auto &cloud, size_t &end, size_t &begin, size_t &w, size_t &removed) {
+    const size_t stop = std::min(end, cloud.size());
+    for (size_t k = begin; k < stop; k++)
+    {
+      const auto &pt = cloud.points[k];
+      if (!keys.empty() && keys.count(key(R_lt * (V3D(pt.x, pt.y, pt.z) - t_l))))
+      {
+        removed++;
+        continue;
+      }
+      if (w != k) cloud.points[w] = pt;
+      w++;
+    }
+    begin = std::max(begin, stop);
+    end = w;
+  };
+  auto tail = [](auto &cloud, size_t begin, size_t w) {
+    for (size_t k = begin; k < cloud.size(); k++) cloud.points[w++] = cloud.points[k];
+    cloud.resize(w);
+  };
+  const size_t n_rgb = pcl_wait_save->size(), n_int = pcl_wait_save_intensity->size(), n_lid = pcl_wait_save_lidar->size();
+  size_t b_rgb = 0, b_int = 0, b_lid = 0, w_rgb = 0, w_int = 0, w_lid = 0, rm_rgb = 0, rm_int = 0, rm_lid = 0, n_with = 0;
+  for (size_t f = 0; f < loop_cloud_end.size() && f < frame_pose.size(); f++)
+  {
+    const FramePose &fp = frame_pose[f];
+    R_lt = (fp.rot * extR).transpose();
+    t_l = fp.rot * extT + fp.pos;
+    keys.clear();
+    auto it = fp.time < 0 ? dyn_frames.end() : dyn_frames.lower_bound(fp.time - 1e-4);
+    if (it != dyn_frames.end() && std::fabs(it->first - fp.time) < 1e-4)
+    {
+      n_with++;
+      for (const auto &q : it->second)
+      {
+        keys.insert(key(R_lt * (q.cast<double>() - t_l)));
+        PointType p;
+        p.x = q[0];
+        p.y = q[1];
+        p.z = q[2];
+        p.intensity = static_cast<float>(fp.time - _first_lidar_time);
+        dyn_cloud->push_back(p);
+      }
+    }
+    loop_cloud_end[f].dyn = dyn_cloud->size();
+    filter(*pcl_wait_save, loop_cloud_end[f].rgb, b_rgb, w_rgb, rm_rgb);
+    filter(*pcl_wait_save_intensity, loop_cloud_end[f].intensity, b_int, w_int, rm_int);
+    filter(*pcl_wait_save_lidar, loop_cloud_end[f].lidar, b_lid, w_lid, rm_lid);
+  }
+  tail(*pcl_wait_save, b_rgb, w_rgb);
+  tail(*pcl_wait_save_intensity, b_int, w_int);
+  tail(*pcl_wait_save_lidar, b_lid, w_lid);
+  dyn_frames.clear();
+  auto pct = [](size_t a, size_t b) { return b ? 100.0 * a / b : 0.0; };
+  printf("[ Dyn ] %zu of %zu frames have detector output, %zu dynamic points; removed %zu of %zu colored (%.2f%%), %zu of %zu intensity "
+         "(%.2f%%), %zu of %zu LiDAR map points (%.2f%%)\n",
+         n_with, loop_cloud_end.size(), dyn_cloud->size(), rm_rgb, n_rgb, pct(rm_rgb, n_rgb), rm_int, n_int, pct(rm_int, n_int), rm_lid, n_lid,
+         pct(rm_lid, n_lid));
 }
 
 void LIVMapper::applyLoopClosure()
@@ -666,6 +840,7 @@ void LIVMapper::applyLoopClosure()
   correct(*pcl_wait_save, &CloudEnd::rgb);
   correct(*pcl_wait_save_intensity, &CloudEnd::intensity);
   correct(*pcl_wait_save_lidar, &CloudEnd::lidar);
+  if (dyn_cloud) correct(*dyn_cloud, &CloudEnd::dyn);
 
   // The trajectory file becomes the corrected one; the odometry is kept in Log/loop/.
   if (pose_output_en)
@@ -771,6 +946,21 @@ void LIVMapper::savePCD()
                 << " with point count: " << pcl_wait_save_intensity->points.size() << RESET << std::endl;
     }
   }
+  if (pcd_save_en && dyn_cloud && !dyn_cloud->empty())
+  {
+    // points the detector found dynamic (removed from the maps above), intensity = time since the first frame in s
+    std::string dyn_dir = std::string(ROOT_DIR) + "Log/pcd/dynamic_points.pcd";
+    std::ofstream f(dyn_dir, std::ios::binary);
+    const size_t n = dyn_cloud->points.size();
+    f << "# .PCD v0.7 - Point Cloud Data file format\nVERSION 0.7\nFIELDS x y z intensity\nSIZE 4 4 4 4\nTYPE F F F F\nCOUNT 1 1 1 1\n"
+      << "WIDTH " << n << "\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS " << n << "\nDATA binary\n";
+    for (const auto &pt : dyn_cloud->points)
+    {
+      const float v[4] = {pt.x, pt.y, pt.z, pt.intensity};
+      f.write(reinterpret_cast<const char *>(v), sizeof(v));
+    }
+    std::cout << GREEN << "Dynamic points saved to: " << dyn_dir << " with point count: " << n << RESET << std::endl;
+  }
 }
 
 void LIVMapper::run() 
@@ -810,6 +1000,7 @@ void LIVMapper::run()
       for (VisualPoint *pt : kv.second->voxel_points)
         if (pt != nullptr)
           for (Feature *ftr : pt->obs_) ftr->img_.release();
+  if (dyn_en) removeDynamicPoints();
   if (loop_en) applyLoopClosure();
   savePCD();
 }

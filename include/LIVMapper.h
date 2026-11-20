@@ -59,8 +59,11 @@ public:
   void pushCameraImage(double stamp, int cam_idx, const cv::Mat &img);
   void loadCameras();
   void writeEvoPose();
-  void recordLoopFrame();
+  void recordFrame();
   void applyLoopClosure();
+  void publishForDetector();
+  void dyn_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg);
+  void removeDynamicPoints();
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
@@ -189,9 +192,31 @@ public:
   PointCloudXYZI::Ptr loop_scan;            // LiDAR points of the current update in the IMU frame
   struct CloudEnd
   {
-    size_t rgb, intensity, lidar;
+    size_t rgb, intensity, lidar, dyn;
   };
   vector<CloudEnd> loop_cloud_end;          // per recorded frame: sizes of the saved clouds once its points are in
+
+  // Dynamic point removal (dyn_removal/...) with an external moving-object detector (M-detector): every LIO update is
+  // published in the IMU frame with its pose, both stamped with the update time; the detector sends back the dynamic
+  // points of each update in the world frame. At the end, every saved point whose source voxel (the per-update
+  // downsampling grid, filter_size_surf in the LiDAR frame) holds a dynamic point is dropped, before the loop correction.
+  bool dyn_en = false;
+  double dyn_wait_sec = 30.0;               // give up waiting for the detector after this long without a message
+  int dyn_max_points = 0;                   // at most this many points per published update (detector buffer size)
+  ros::Publisher pubDynBody, pubDynOdom;
+  ros::Subscriber subDyn;
+  std::map<double, std::vector<Eigen::Vector3f>> dyn_frames;  // detector output per update time (world frame)
+  double dyn_last_stamp = -1.0;
+  ros::WallTime dyn_last_recv;
+  struct FramePose
+  {
+    double time;
+    M3D rot;                                // LIO estimate of the update: its points were placed with it
+    V3D pos;
+  };
+  FramePose dyn_cur_pose;
+  vector<FramePose> frame_pose;             // per recorded frame, parallel to loop_cloud_end
+  PointCloudXYZI::Ptr dyn_cloud;            // detector output of the recorded frames, saved as dynamic_points.pcd
   std::ofstream evo_file;                   // TUM trajectory (evo/pose_output_en)
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
